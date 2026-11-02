@@ -658,6 +658,12 @@ expand_text(Shell *shell, const char *source, char **result, int *quoted_result,
     return 0;
 }
 
+int
+script_expand_command(Shell *shell, const char *command, char **expanded)
+{
+    return expand_text(shell, command, expanded, NULL, 0, 0);
+}
+
 static int
 validate_test(const char *text, size_t line, ScriptError *error)
 {

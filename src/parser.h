@@ -27,6 +27,8 @@ typedef struct {
 typedef struct {
     size_t offset;
     char message[160];
+    int incomplete;
+    int line_continuation;
 } ParseError;
 
 typedef enum {
@@ -57,9 +59,13 @@ typedef struct {
 /* Returns zero on success, including for empty/whitespace-only input. */
 int lexer_tokenize(const char *input, TokenList *tokens, ParseError *error);
 void lexer_tokens_free(TokenList *tokens);
+/* Returns 1 for lexically incomplete input, 0 when complete, and -1 on error. */
+int lexer_inspect_input(const char *input, int *has_substitution, ParseError *error);
 
 /* Parses words, pipes, redirections, and an optional trailing background '&'. */
 int parser_parse(const char *input, Pipeline *pipeline, ParseError *error);
+/* Returns 1 for incomplete, 0 for complete, and -1 for invalid input. */
+int parser_classify_input(const char *input, ParseError *error);
 void parser_pipeline_free(Pipeline *pipeline);
 
 #endif

@@ -22,6 +22,102 @@ set_error(ParseError *error, size_t offset, const char *message)
     (void)snprintf(error->message, sizeof(error->message), "%s", message);
 }
 
+int
+lexer_inspect_input(const char *input, int *has_substitution, ParseError *error)
+{
+    enum { MAX_LEXICAL_NESTING = 256 };
+    unsigned char quotes[MAX_LEXICAL_NESTING] = {0};
+    unsigned char frames[MAX_LEXICAL_NESTING] = {0};
+    size_t depth = 0, i = 0;
+    int has = 0;
+
+    if (input == NULL) {
+        set_error(error, 0, "invalid lexer argument");
+        return -1;
+    }
+    if (error != NULL)
+        memset(error, 0, sizeof(*error));
+    while (input[i] != '\0') {
+        unsigned char c = (unsigned char)input[i];
+        unsigned char quote = quotes[depth];
+        if (quote == '\'') {
+            if (c == '\'')
+                quotes[depth] = 0;
+            ++i;
+            continue;
+        }
+        if (c == '\\') {
+            if (input[i + 1] == '\0') {
+                if (error != NULL) {
+                    error->offset = i;
+                    error->incomplete = 1;
+                    error->line_continuation = 1;
+                    (void)snprintf(error->message, sizeof(error->message),
+                                   "line continuation");
+                }
+                return 1;
+            }
+            i += 2;
+            continue;
+        }
+        if (c == '$' && input[i + 1] == '(') {
+            if (depth + 1 >= MAX_LEXICAL_NESTING) {
+                set_error(error, i, "command substitution nesting is too deep");
+                return -1;
+            }
+            has = 1;
+            frames[++depth] = 1;
+            quotes[depth] = 0;
+            i += 2;
+            continue;
+        }
+        if (c == '`') {
+            has = 1;
+            if (frames[depth] == 2 && quote == 0) {
+                --depth;
+            } else {
+                if (depth + 1 >= MAX_LEXICAL_NESTING) {
+                    set_error(error, i, "command substitution nesting is too deep");
+                    return -1;
+                }
+                frames[++depth] = 2;
+                quotes[depth] = 0;
+            }
+            ++i;
+            continue;
+        }
+        if (c == ')' && frames[depth] == 1 && quote == 0) {
+            --depth;
+            ++i;
+            continue;
+        }
+        if (c == '\'' || c == '"') {
+            if (quote == 0)
+                quotes[depth] = c;
+            else if (quote == c)
+                quotes[depth] = 0;
+            ++i;
+            continue;
+        }
+        ++i;
+    }
+    if (has_substitution != NULL)
+        *has_substitution = has;
+    if (depth != 0 || quotes[depth] != 0) {
+        if (error != NULL) {
+            error->offset = strlen(input);
+            error->incomplete = 1;
+            (void)snprintf(error->message, sizeof(error->message), "%s",
+                           quotes[depth] == '\'' ? "unclosed single quote" :
+                           quotes[depth] == '"' ? "unclosed double quote" :
+                           frames[depth] == 2 ? "unclosed backtick substitution" :
+                           "unclosed command substitution");
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static int
 builder_append(WordBuilder *builder, char c)
 {
@@ -132,6 +228,10 @@ lexer_tokenize(const char *input, TokenList *tokens, ParseError *error)
     memset(tokens, 0, sizeof(*tokens));
     if (error != NULL)
         memset(error, 0, sizeof(*error));
+
+    int incomplete = lexer_inspect_input(input, NULL, error);
+    if (incomplete != 0)
+        return -1;
 
     while (input[i] != '\0') {
         unsigned char c = (unsigned char)input[i];

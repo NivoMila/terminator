@@ -86,6 +86,7 @@ struct Shell {
 int shell_emit(Shell *shell, ShellEventType type,
                const char *text, size_t length, int status);
 int execute_line(Shell *shell, const char *line, int *should_exit);
+int execute_interactive_line(Shell *shell, const char *line, int *should_exit);
 void execute_reap_jobs(Shell *shell);
 void execute_cleanup_jobs(Shell *shell);
 

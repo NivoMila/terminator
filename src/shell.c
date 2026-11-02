@@ -149,7 +149,7 @@ shell_worker(void *argument)
             shell->command_tail = NULL;
         (void)pthread_mutex_unlock(&shell->mutex);
 
-        status = execute_line(shell, command->line, &should_exit);
+        status = execute_interactive_line(shell, command->line, &should_exit);
         free(command->line);
         free(command);
         (void)shell_emit(shell, SHELL_EVENT_COMMAND_DONE, NULL, 0, status);

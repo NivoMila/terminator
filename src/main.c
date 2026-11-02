@@ -5,6 +5,7 @@
 #include "key_config.h"
 #include "editor.h"
 #include "xclipboard.h"
+#include "interactive_input.h"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -39,6 +40,7 @@ typedef struct {
     size_t cursor;
     size_t scroll_rows;
     HistoryCursor history_cursor;
+    InteractiveInput multiline_input;
     int history_search_active;
     char *history_search_input;
     size_t history_search_length;
@@ -142,6 +144,7 @@ tab_destroy(Tab *tab)
     free(tab->partial_line);
     free(tab->history_search_input);
     history_cursor_reset(&tab->history_cursor);
+    interactive_input_destroy(&tab->multiline_input);
     shell_destroy(tab->shell);
     memset(tab, 0, sizeof(*tab));
 }
@@ -425,7 +428,8 @@ static void
 draw_input(App *app)
 {
     Tab *tab = app->tabs[app->active_tab];
-    const char *prompt = tab->history_search_active ? "Enter search term: " : "user@terminator> ";
+    const char *prompt = tab->history_search_active ? "Enter search term: " :
+                         tab->multiline_input.active ? "> " : "user@terminator> ";
     char empty_search_input[1] = {0};
     char *input = tab->history_search_active ?
         (tab->history_search_input == NULL ? empty_search_input : tab->history_search_input) : tab->input;
@@ -769,20 +773,45 @@ complete_input(Tab *tab)
 static void
 submit_input(App *app, Tab *tab)
 {
-    size_t prompt_len = strlen("user@terminator> ");
+    int was_continuing = tab->multiline_input.active;
+    const char *prompt = was_continuing ? "> " : "user@terminator> ";
+    size_t prompt_len = strlen(prompt);
     char *line = malloc(prompt_len + tab->input_length + 1);
-    char *command = strdup(tab->input);
+    char *command = NULL;
+    ParseError error;
+    InteractiveInputResult result;
     if (line == NULL)
         fatal("malloc submitted line");
-    if (command == NULL)
-        fatal("strdup command");
-    memcpy(line, "user@terminator> ", prompt_len);
+    result = interactive_input_enter(&tab->multiline_input, tab->input,
+                                     &command, &error);
+    memcpy(line, prompt, prompt_len);
     memcpy(line + prompt_len, tab->input, tab->input_length + 1);
     tab_append_line(tab, line);
-    if (shell_submit(tab->shell, command) == 0) {
+    if (result == INTERACTIVE_INPUT_CONTINUE) {
+        free(line);
+        tab->input_length = 0;
+        tab->cursor = 0;
+        tab->input[0] = '\0';
+        history_navigation_reset(tab);
+        return;
+    }
+    if (result == INTERACTIVE_INPUT_INVALID) {
+        if (command != NULL) {
+            char message[256];
+            int count = snprintf(message, sizeof(message),
+                                 "terminator: syntax error at byte %zu: %s",
+                                 error.offset, error.message);
+            if (count > 0)
+                tab_append_line(tab, message);
+            if (app->history != NULL && command[0] != '\0')
+                (void)history_add(app->history, command);
+        } else {
+            tab_append_line(tab, "terminator: unable to parse command");
+        }
+    } else if (shell_submit(tab->shell, command) == 0) {
         if (app->history != NULL && command[0] != '\0')
             (void)history_add(app->history, command);
-        if (tab->input_length != 0)
+        if (command[0] != '\0')
             tab->busy = 1;
     } else {
         tab_append_line(tab, "terminator: unable to submit command");
@@ -827,6 +856,15 @@ handle_key(App *app, XKeyEvent *event)
         } else if (!control && count > 0 && (unsigned char)bytes[0] >= 32) {
             history_search_append(tab, bytes, (size_t)count);
         }
+        return;
+    }
+    if (action == SHORTCUT_INTERRUPT && tab->multiline_input.active) {
+        (void)interactive_input_cancel(&tab->multiline_input);
+        tab->input_length = 0;
+        tab->cursor = 0;
+        tab->input[0] = '\0';
+        history_navigation_reset(tab);
+        tab_append_line(tab, "^C");
         return;
     }
     if (control && (symbol == XK_r || symbol == XK_R)) {

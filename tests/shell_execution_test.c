@@ -126,6 +126,15 @@ main(void)
     expect_contains(shell, wake[0], "echo hello | wc -c", "6");
     expect_contains(shell, wake[0], "printf hello | wc -c", "5");
     expect_contains(shell, wake[0], "printf hello | tr h H | wc -c", "5");
+    expect_contains(shell, wake[0], "echo '$HOME'", "$HOME");
+    if (getenv("HOME") != NULL)
+        expect_contains(shell, wake[0], "echo \"$HOME\"", getenv("HOME"));
+    expect_contains(shell, wake[0], "echo \"first\nsecond\"", "first\nsecond");
+    expect_contains(shell, wake[0], "echo \"$(printf '%s' \"$(printf nested)\")\"",
+                    "nested");
+    expect_contains(shell, wake[0], "echo \"$(printf '%s' `printf nested`)\"",
+                    "nested");
+    expect_contains(shell, wake[0], "echo \"$(printf 'multi\nline')\"", "multi\nline");
     expect_contains(shell, wake[0], "sh -c 'echo stage-error >&2' | cat", "stage-error");
     result = run_line(shell, wake[0], "false | sh -c 'exit 7'");
     assert(result.status == 7);

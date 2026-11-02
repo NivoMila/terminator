@@ -61,8 +61,15 @@ order. Duplicate redirections, missing targets, unclosed quotes, dangling
 escapes, and empty pipeline stages are syntax errors. Single quotes preserve their contents; double quotes remove
 the delimiters and allow the supported escapes; adjacent quoted and unquoted
 word fragments concatenate. Semicolon and other unlisted operators are not
-command separators in this grammar. Variable expansion, command substitution,
-multiline continuation, and script parsing remain for later stages.
+command separators in this grammar. Interactive input uses the same lexer and
+parser to distinguish incomplete quoting/substitutions and trailing-backslash
+continuations from invalid syntax. Each tab retains the accumulated command
+until complete; Ctrl+C cancels an unfinished continuation. Completed commands
+use the script interpreter's existing expansion path before ordinary parsing,
+including nested `$(...)` and backtick substitutions. A trailing backslash
+continues without inserting a newline; open quotes and substitutions preserve
+the newline between physical input lines. Multiline history records are stored
+as escaped records so the history file remains line-delimited.
 
 ## multiWatch
 

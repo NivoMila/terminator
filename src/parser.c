@@ -229,3 +229,22 @@ fail:
     parser_pipeline_free(pipeline);
     return -1;
 }
+
+int
+parser_classify_input(const char *input, ParseError *error)
+{
+    int has_substitution = 0;
+    int state = lexer_inspect_input(input, &has_substitution, error);
+    if (state != 0)
+        return state;
+    /* The interactive executor expands substitutions before parsing. Parsing
+       their bodies here as outer pipeline syntax would misclassify operators
+       inside $(...) as separators belonging to the submitted command. */
+    if (has_substitution)
+        return 0;
+    Pipeline pipeline;
+    if (parser_parse(input, &pipeline, error) < 0)
+        return -1;
+    parser_pipeline_free(&pipeline);
+    return 0;
+}

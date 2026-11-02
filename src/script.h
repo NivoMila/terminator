@@ -21,5 +21,7 @@ int script_execute(Shell *shell, ScriptProgram *program,
 int script_invoke(Shell *shell, const char *path, int argc, char **argv,
                   int source_mode, int *exit_status);
 const char *script_variable_get(Shell *shell, const char *name);
+/* Expand one interactive command using the script interpreter's expansion rules. */
+int script_expand_command(Shell *shell, const char *command, char **expanded);
 
 #endif

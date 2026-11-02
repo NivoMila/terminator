@@ -1435,3 +1435,19 @@ execute_line(Shell *shell, const char *line, int *should_exit)
     parser_pipeline_free(&pipeline);
     return status;
 }
+
+int
+execute_interactive_line(Shell *shell, const char *line, int *should_exit)
+{
+    char *expanded = NULL;
+    int status;
+    if (script_expand_command(shell, line, &expanded) < 0) {
+        status = emit_error(shell, "command expansion", strerror(errno));
+        *should_exit = 0;
+    } else {
+        status = execute_line(shell, expanded, should_exit);
+        free(expanded);
+    }
+    shell->script_status = status;
+    return status;
+}

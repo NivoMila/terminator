@@ -72,6 +72,7 @@ main(void)
     assert(history_count(history) == 0);
     assert(history_add(history, "echo one") == 0);
     assert(history_add(history, "echo two") == 0);
+    assert(history_add(history, "echo two\ncontinued") == 0);
     {
         char **matches = NULL;
         size_t count = 0;
@@ -91,7 +92,7 @@ main(void)
         assert(history_search(history, "ec", &matches, &count) == 0);
         assert(count == 0 && matches == NULL);
         assert(history_recent(history, 2, &matches, &count, &first_index) == 0);
-        assert(count == 2 && first_index == 3);
+        assert(count == 2 && first_index == 4);
         assert(strcmp(matches[0], "copy alpha source") == 0);
         assert(strcmp(matches[1], "compile beta target") == 0);
         free(matches[0]); free(matches[1]); free(matches);
@@ -122,9 +123,12 @@ main(void)
     history_close(history);
     history_close(second);
     history = history_open(history_path);
-    assert(history != NULL && history_count(history) == 205);
+    assert(history != NULL && history_count(history) == 206);
     entry = history_get(history, 0);
     assert(entry != NULL && strcmp(entry, "echo one") == 0);
+    free(entry);
+    entry = history_get(history, 2);
+    assert(entry != NULL && strcmp(entry, "echo two\ncontinued") == 0);
     free(entry);
     history_close(history);
 
