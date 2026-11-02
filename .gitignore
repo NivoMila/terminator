@@ -1,0 +1,3 @@
+/terminator
+/src/*.o
+/tests/parser_test
