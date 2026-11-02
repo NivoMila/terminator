@@ -338,6 +338,8 @@ void
 shell_completion_free(char **matches, size_t match_count)
 {
     size_t i;
+    if (matches == NULL)
+        return;
     for (i = 0; i < match_count; ++i)
         free(matches[i]);
     free(matches);

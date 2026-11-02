@@ -6,6 +6,7 @@
 #include "editor.h"
 #include "xclipboard.h"
 #include "interactive_input.h"
+#include "completion_selection.h"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -41,6 +42,7 @@ typedef struct {
     size_t scroll_rows;
     HistoryCursor history_cursor;
     InteractiveInput multiline_input;
+    CompletionSelection completion_selection;
     int history_search_active;
     char *history_search_input;
     size_t history_search_length;
@@ -130,6 +132,7 @@ tab_init(Tab *tab, int wake_write_fd, History *history)
     if (tab->shell == NULL)
         fatal("create shell worker");
     shell_set_history(tab->shell, history);
+    completion_selection_init(&tab->completion_selection);
 }
 
 static void
@@ -145,6 +148,7 @@ tab_destroy(Tab *tab)
     free(tab->history_search_input);
     history_cursor_reset(&tab->history_cursor);
     interactive_input_destroy(&tab->multiline_input);
+    completion_selection_clear(&tab->completion_selection);
     shell_destroy(tab->shell);
     memset(tab, 0, sizeof(*tab));
 }
@@ -725,7 +729,7 @@ complete_input(Tab *tab)
     size_t new_length;
 
     history_navigation_reset(tab);
-    if (tab->cursor != tab->input_length)
+    if (tab->cursor > tab->input_length)
         return;
     start = current_word_start(tab->input, tab->cursor);
     prefix = decode_word_prefix(tab->input, start, tab->cursor);
@@ -763,11 +767,37 @@ complete_input(Tab *tab)
             free(encoded);
         }
     } else {
-        for (i = 0; i < count; ++i)
-            tab_append_line(tab, matches[i]);
+        if (completion_selection_begin(&tab->completion_selection, &matches,
+                                       &count, start) == 0) {
+            for (i = 0; i < tab->completion_selection.count; ++i) {
+                char *line;
+                int needed = snprintf(NULL, 0, "%zu. %s", i + 1,
+                                      completion_selection_match(
+                                          &tab->completion_selection, i));
+                if (needed < 0)
+                    continue;
+                line = malloc((size_t)needed + 1);
+                if (line == NULL)
+                    fatal("malloc completion list line");
+                (void)snprintf(line, (size_t)needed + 1, "%zu. %s", i + 1,
+                               completion_selection_match(
+                                   &tab->completion_selection, i));
+                tab_append_line(tab, line);
+                free(line);
+            }
+        }
     }
     free(prefix);
     shell_completion_free(matches, count);
+}
+
+static void
+completion_apply_choice(Tab *tab, size_t index)
+{
+    (void)completion_selection_apply(&tab->completion_selection, index,
+                                     &tab->input, &tab->input_capacity,
+                                     &tab->input_length, &tab->cursor);
+    completion_selection_clear(&tab->completion_selection);
 }
 
 static void
@@ -828,8 +858,10 @@ static void
 paste_into_active_input(void *context, const char *text, size_t length)
 {
     App *app = context;
-    if (app->tab_count != 0 && !app->tabs[app->active_tab]->history_search_active)
+    if (app->tab_count != 0 && !app->tabs[app->active_tab]->history_search_active) {
+        completion_selection_clear(&app->tabs[app->active_tab]->completion_selection);
         input_insert(app->tabs[app->active_tab], text, length);
+    }
 }
 
 static void
@@ -860,12 +892,52 @@ handle_key(App *app, XKeyEvent *event)
     }
     if (action == SHORTCUT_INTERRUPT && tab->multiline_input.active) {
         (void)interactive_input_cancel(&tab->multiline_input);
+        completion_selection_clear(&tab->completion_selection);
         tab->input_length = 0;
         tab->cursor = 0;
         tab->input[0] = '\0';
         history_navigation_reset(tab);
         tab_append_line(tab, "^C");
         return;
+    }
+    if (tab->completion_selection.active) {
+        int selection_key = -1;
+        size_t chosen = 0;
+        CompletionSelectionResult result;
+        if ((event->state & (ControlMask | Mod1Mask)) == 0 &&
+            symbol >= XK_0 && symbol <= XK_9)
+            selection_key = (int)symbol;
+        else if ((event->state & (ControlMask | Mod1Mask)) == 0 &&
+                 symbol >= XK_KP_0 && symbol <= XK_KP_9)
+            selection_key = (int)('0' + symbol - XK_KP_0);
+        else if (symbol == XK_BackSpace)
+            selection_key = '\b';
+        else if (symbol == XK_Return || symbol == XK_KP_Enter)
+            selection_key = '\n';
+        else if (symbol == XK_Escape)
+            selection_key = 27;
+        if (selection_key >= 0) {
+            result = completion_selection_key(&tab->completion_selection,
+                                              selection_key, &chosen);
+            if (result == COMPLETION_SELECTION_CHOSEN)
+                completion_apply_choice(tab, chosen);
+            else if (result == COMPLETION_SELECTION_INVALID) {
+                tab_append_line(tab, "Invalid completion selection");
+                completion_selection_clear(&tab->completion_selection);
+            } else if (result == COMPLETION_SELECTION_CANCELLED) {
+                completion_selection_clear(&tab->completion_selection);
+            }
+            return;
+        }
+        if (tab->completion_selection.digit_count != 0 && !control &&
+            count > 0 && (unsigned char)bytes[0] >= 32) {
+            tab_append_line(tab, "Invalid completion selection");
+            completion_selection_clear(&tab->completion_selection);
+            return;
+        }
+        /* Other shortcuts and ordinary editing cancel selection and retain
+         * their normal meaning. */
+        completion_selection_clear(&tab->completion_selection);
     }
     if (control && (symbol == XK_r || symbol == XK_R)) {
         tab->history_search_active = 1;

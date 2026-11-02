@@ -171,8 +171,16 @@ Filename completion is requested through the active tab's `Shell` interface.
 The API holds the shell mutex while resolving the prefix from that tab's cwd FD
 and enumerating the target directory. The GUI decodes the unfinished shell
 word, requests matches, inserts a unique match or its common prefix with shell
-escaping, and lists multiple matches when the prefix cannot be extended.
-Directory matches end in `/`, allowing the user to continue entering a path.
+escaping, and lists multiple matches with one-based numbers when the prefix
+cannot be extended. Completion replaces text from the current word's start to
+the cursor and preserves the rest of the line as typed. Pressing a listed
+number replaces that unfinished prefix with its candidate; candidates whose
+number is also a prefix of a longer number remain pending until another digit
+or Enter disambiguates the choice. Escape
+cancels selection, and invalid choices leave the command line intact. Selection
+state belongs to each tab. Directory matches end in `/`, allowing the user to
+continue entering a path. Candidate insertion uses the same shell escaping as
+ordinary completion, including filenames with spaces and nested paths.
 
 Shortcuts load once from `$HOME/.terminatorrc`; missing or invalid files leave
 defaults active. The format is one `action = Modifier+Key` entry per line,
