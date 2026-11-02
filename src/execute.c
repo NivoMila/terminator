@@ -1352,6 +1352,31 @@ execute_line(Shell *shell, const char *line, int *should_exit)
         return status;
     }
 
+    if (strcmp(command->argv[0], "history") == 0) {
+        char **entries = NULL;
+        size_t count = 0, first = 0;
+        if (command->argc != 1) {
+            status = emit_error(shell, "history", "usage: history");
+        } else if (shell->history == NULL) {
+            status = emit_error(shell, "history", "history is unavailable");
+        } else if (history_recent(shell->history, 1000, &entries, &count, &first) < 0) {
+            status = emit_error(shell, "history", strerror(errno));
+        } else {
+            for (size_t i = 0; i < count; ++i) {
+                char line[64];
+                int n = snprintf(line, sizeof(line), "%5zu  ", first + i + 1);
+                if (n > 0)
+                    (void)shell_emit(shell, SHELL_EVENT_OUTPUT, line, (size_t)n, 0);
+                (void)shell_emit(shell, SHELL_EVENT_OUTPUT, entries[i], strlen(entries[i]), 0);
+                (void)shell_emit(shell, SHELL_EVENT_OUTPUT, "\n", 1, 0);
+                free(entries[i]);
+            }
+            free(entries);
+        }
+        parser_pipeline_free(&pipeline);
+        return status;
+    }
+
     if (strcmp(command->argv[0], "source") == 0) {
         if (command->argc < 2) status = emit_error(shell, "source", "usage: source script [arguments ...]");
         else if (command->argc == 2)

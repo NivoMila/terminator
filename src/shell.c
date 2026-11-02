@@ -231,6 +231,16 @@ fail:
     return NULL;
 }
 
+void
+shell_set_history(Shell *shell, History *history)
+{
+    if (shell == NULL)
+        return;
+    (void)pthread_mutex_lock(&shell->mutex);
+    shell->history = history;
+    (void)pthread_mutex_unlock(&shell->mutex);
+}
+
 int
 shell_submit(Shell *shell, const char *line)
 {

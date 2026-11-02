@@ -2,6 +2,7 @@
 #define TERMINATOR_SHELL_INTERNAL_H
 
 #include "shell.h"
+#include "history.h"
 
 #include <pthread.h>
 #include <sys/types.h>
@@ -74,6 +75,7 @@ struct Shell {
     int cwd_fd;
     char *cwd_path;
     int wake_write_fd;
+    History *history;
     ShellCommand *command_head;
     ShellCommand *command_tail;
     ShellEventNode *event_head;

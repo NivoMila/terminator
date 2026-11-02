@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 typedef struct Shell Shell;
+typedef struct History History;
 
 typedef enum {
     SHELL_EVENT_OUTPUT,
@@ -20,6 +21,8 @@ typedef struct {
 
 /* wake_write_fd is shared with the GUI and must remain open until shell_destroy. */
 Shell *shell_create(int wake_write_fd);
+/* Set the shared GUI-owned history before submitting commands. */
+void shell_set_history(Shell *shell, History *history);
 int shell_submit(Shell *shell, const char *line);
 /* Signal only the active foreground process group; returns kill()'s result. */
 int shell_signal_foreground(Shell *shell, int suspend);

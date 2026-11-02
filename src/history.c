@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
@@ -226,6 +227,156 @@ history_get(History *history, size_t index)
         copy = strdup(history->items[index]);
     (void)pthread_mutex_unlock(&history->mutex);
     return copy;
+}
+
+static size_t
+longest_common_substring(const char *left, const char *right)
+{
+    size_t left_length = strlen(left), right_length = strlen(right);
+    size_t *previous, *current, best = 0;
+    if (left_length == 0 || right_length == 0)
+        return 0;
+    previous = calloc(right_length + 1, sizeof(*previous));
+    current = calloc(right_length + 1, sizeof(*current));
+    if (previous == NULL || current == NULL) {
+        free(previous);
+        free(current);
+        return SIZE_MAX;
+    }
+    for (size_t i = 1; i <= left_length; ++i) {
+        for (size_t j = 1; j <= right_length; ++j) {
+            current[j] = left[i - 1] == right[j - 1] ? previous[j - 1] + 1 : 0;
+            if (current[j] > best)
+                best = current[j];
+        }
+        size_t *swap = previous;
+        previous = current;
+        current = swap;
+        memset(current, 0, (right_length + 1) * sizeof(*current));
+    }
+    free(previous);
+    free(current);
+    return best;
+}
+
+int
+history_search(History *history, const char *term,
+               char ***matches, size_t *match_count)
+{
+    size_t best = 0, exact = SIZE_MAX;
+    char **result = NULL;
+    size_t count = 0;
+    if (history == NULL || term == NULL || matches == NULL || match_count == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    *matches = NULL;
+    *match_count = 0;
+    (void)pthread_mutex_lock(&history->mutex);
+    history_refresh_locked(history);
+    for (size_t i = 0; i < history->count; ++i) {
+        if (strcmp(history->items[i], term) == 0)
+            exact = i;
+    }
+    if (exact != SIZE_MAX) {
+        result = calloc(1, sizeof(*result));
+        if (result != NULL)
+            result[0] = strdup(history->items[exact]);
+        if (result == NULL || result[0] == NULL) {
+            free(result);
+            (void)pthread_mutex_unlock(&history->mutex);
+            return -1;
+        }
+        count = 1;
+    } else {
+        size_t *lengths = calloc(history->count ? history->count : 1, sizeof(*lengths));
+        if (lengths == NULL) {
+            (void)pthread_mutex_unlock(&history->mutex);
+            return -1;
+        }
+        for (size_t i = 0; i < history->count; ++i) {
+            lengths[i] = longest_common_substring(history->items[i], term);
+            if (lengths[i] == SIZE_MAX) {
+                free(lengths);
+                (void)pthread_mutex_unlock(&history->mutex);
+                return -1;
+            }
+            if (lengths[i] > best)
+                best = lengths[i];
+        }
+        if (best > 2) {
+            for (size_t i = 0; i < history->count; ++i)
+                if (lengths[i] == best)
+                    ++count;
+            result = calloc(count, sizeof(*result));
+            if (result == NULL) {
+                free(lengths);
+                (void)pthread_mutex_unlock(&history->mutex);
+                return -1;
+            }
+            size_t out = 0;
+            for (size_t i = 0; i < history->count; ++i) {
+                if (lengths[i] == best) {
+                    result[out] = strdup(history->items[i]);
+                    if (result[out] == NULL) {
+                        while (out > 0)
+                            free(result[--out]);
+                        free(result);
+                        free(lengths);
+                        (void)pthread_mutex_unlock(&history->mutex);
+                        return -1;
+                    }
+                    ++out;
+                }
+            }
+        }
+        free(lengths);
+    }
+    (void)pthread_mutex_unlock(&history->mutex);
+    *matches = result;
+    *match_count = count;
+    return 0;
+}
+
+int
+history_recent(History *history, size_t limit,
+               char ***entries, size_t *entry_count, size_t *first_index)
+{
+    char **result = NULL;
+    size_t count, start;
+    if (history == NULL || entries == NULL || entry_count == NULL || first_index == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    *entries = NULL;
+    *entry_count = 0;
+    *first_index = 0;
+    (void)pthread_mutex_lock(&history->mutex);
+    history_refresh_locked(history);
+    count = history->count < limit ? history->count : limit;
+    start = history->count - count;
+    if (count != 0) {
+        result = calloc(count, sizeof(*result));
+        if (result == NULL) {
+            (void)pthread_mutex_unlock(&history->mutex);
+            return -1;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            result[i] = strdup(history->items[start + i]);
+            if (result[i] == NULL) {
+                while (i > 0)
+                    free(result[--i]);
+                free(result);
+                (void)pthread_mutex_unlock(&history->mutex);
+                return -1;
+            }
+        }
+    }
+    (void)pthread_mutex_unlock(&history->mutex);
+    *entries = result;
+    *entry_count = count;
+    *first_index = start;
+    return 0;
 }
 
 int

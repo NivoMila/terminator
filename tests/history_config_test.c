@@ -50,6 +50,7 @@ int
 main(void)
 {
     char history_path[] = "/tmp/terminator-history-XXXXXX";
+    char bulk_history_path[] = "/tmp/terminator-history-bulk-XXXXXX";
     char config_path[] = "/tmp/terminator-config-XXXXXX";
     int history_fd = mkstemp(history_path);
     int config_fd = mkstemp(config_path);
@@ -71,15 +72,38 @@ main(void)
     assert(history_count(history) == 0);
     assert(history_add(history, "echo one") == 0);
     assert(history_add(history, "echo two") == 0);
+    {
+        char **matches = NULL;
+        size_t count = 0;
+        size_t first_index = 0;
+        assert(history_add(history, "compile alpha target") == 0);
+        assert(history_add(history, "copy alpha source") == 0);
+        assert(history_add(history, "compile beta target") == 0);
+        assert(history_search(history, "echo two", &matches, &count) == 0);
+        assert(count == 1 && strcmp(matches[0], "echo two") == 0);
+        free(matches[0]);
+        free(matches);
+        assert(history_search(history, "prefix alpha ending", &matches, &count) == 0);
+        assert(count == 2);
+        assert(strcmp(matches[0], "compile alpha target") == 0);
+        assert(strcmp(matches[1], "copy alpha source") == 0);
+        free(matches[0]); free(matches[1]); free(matches);
+        assert(history_search(history, "ec", &matches, &count) == 0);
+        assert(count == 0 && matches == NULL);
+        assert(history_recent(history, 2, &matches, &count, &first_index) == 0);
+        assert(count == 2 && first_index == 3);
+        assert(strcmp(matches[0], "copy alpha source") == 0);
+        assert(strcmp(matches[1], "compile beta target") == 0);
+        free(matches[0]); free(matches[1]); free(matches);
+    }
     entry = history_cursor_previous(history, &cursor, "draft");
-    assert(entry != NULL && strcmp(entry, "echo two") == 0);
+    assert(entry != NULL && strcmp(entry, "compile beta target") == 0);
     free(entry);
     entry = history_cursor_previous(history, &cursor, "ignored");
-    assert(entry != NULL && strcmp(entry, "echo one") == 0);
+    assert(entry != NULL && strcmp(entry, "copy alpha source") == 0);
     free(entry);
-    assert(history_cursor_previous(history, &cursor, "ignored") == NULL);
     entry = history_cursor_next(history, &cursor);
-    assert(entry != NULL && strcmp(entry, "echo two") == 0);
+    assert(entry != NULL && strcmp(entry, "compile beta target") == 0);
     free(entry);
     entry = history_cursor_next(history, &cursor);
     assert(entry != NULL && strcmp(entry, "draft") == 0);
@@ -98,16 +122,41 @@ main(void)
     history_close(history);
     history_close(second);
     history = history_open(history_path);
-    assert(history != NULL && history_count(history) == 202);
+    assert(history != NULL && history_count(history) == 205);
     entry = history_get(history, 0);
     assert(entry != NULL && strcmp(entry, "echo one") == 0);
     free(entry);
     history_close(history);
 
+    int bulk_fd = mkstemp(bulk_history_path);
+    assert(bulk_fd >= 0);
+    for (i = 0; i < 1005; ++i) {
+        char row[32];
+        int length = snprintf(row, sizeof(row), "entry-%04u\n", i);
+        assert(length > 0 && write(bulk_fd, row, (size_t)length) == length);
+    }
+    close(bulk_fd);
+    History *bulk = history_open(bulk_history_path);
+    assert(bulk != NULL);
+    char **recent = NULL;
+    size_t recent_count = 0, recent_first = 0;
+    assert(history_recent(bulk, 1000, &recent, &recent_count, &recent_first) == 0);
+    assert(recent_count == 1000 && recent_first == 5);
+    assert(strcmp(recent[0], "entry-0005") == 0);
+    assert(strcmp(recent[999], "entry-1004") == 0);
+    for (i = 0; i < recent_count; ++i)
+        free(recent[i]);
+    free(recent);
+    history_close(bulk);
+    assert(unlink(bulk_history_path) == 0);
+
     write_file(config_path,
                "# valid override\n"
                "new_tab = Alt+N\n"
                "close_tab = Alt+N\n" /* Conflicts; ignored. */
+               "close_tab = Ctrl+W\n" /* Reserved for word deletion. */
+               "interrupt = Ctrl+Shift+C\n" /* Reserved for clipboard copy. */
+               "history_next = Ctrl+D\n" /* Reserved for EOF/tab close. */
                "next_tab = Ctrl+NotAKey\n" /* Invalid; default retained. */
                "complete = Ctrl+Shift+Tab\n" /* Conflicts; ignored. */
                "previous_tab = Alt+P\n"
@@ -115,7 +164,8 @@ main(void)
     int accepted = key_config_load(&config, config_path);
     assert(accepted == 3);
     assert(key_config_match(&config, XK_n, Mod1Mask) == SHORTCUT_NEW_TAB);
-    assert(key_config_match(&config, XK_w, ControlMask) == SHORTCUT_CLOSE_TAB);
+    assert(key_config_match(&config, XK_w, ControlMask) == SHORTCUT_NONE);
+    assert(key_config_match(&config, XK_w, Mod1Mask) == SHORTCUT_CLOSE_TAB);
     assert(key_config_match(&config, XK_Tab, ControlMask) == SHORTCUT_NEXT_TAB);
     assert(key_config_match(&config, XK_p, Mod1Mask) == SHORTCUT_PREVIOUS_TAB);
     assert(key_config_match(&config, XK_Tab, ControlMask | ShiftMask) ==

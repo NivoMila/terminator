@@ -177,7 +177,7 @@ disabling the default binding. Example:
 
 ```text
 new_tab = Ctrl+T
-close_tab = Ctrl+W
+close_tab = Alt+W
 next_tab = Ctrl+Tab
 previous_tab = Ctrl+Shift+Tab
 interrupt = Ctrl+C
@@ -186,6 +186,14 @@ complete = Tab
 history_previous = Up
 history_next = Down
 ```
+
+The required line-editing chords (Ctrl+A/E/U/K/W/L, Ctrl+D, Ctrl+R, and
+Ctrl+Shift+C/V) are reserved and cannot be rebound by `.terminatorrc`.
+Ctrl+W deletes the previous whitespace-delimited word; close-tab defaults to
+Alt+W. Ctrl+Shift+C owns the X11 `CLIPBOARD` selection with `TARGETS`,
+`UTF8_STRING`, and `STRING` support and copies the editable command line.
+Ctrl+Shift+V requests that selection and inserts the returned text at the
+active tab's cursor. Ctrl+D closes the active tab, including the last tab.
 
 This configuration and locking design is for thread mode. Process mode remains
 unimplemented.

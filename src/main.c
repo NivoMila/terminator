@@ -3,6 +3,8 @@
 #include "shell.h"
 #include "history.h"
 #include "key_config.h"
+#include "editor.h"
+#include "xclipboard.h"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -37,6 +39,10 @@ typedef struct {
     size_t cursor;
     size_t scroll_rows;
     HistoryCursor history_cursor;
+    int history_search_active;
+    char *history_search_input;
+    size_t history_search_length;
+    size_t history_search_capacity;
     char *partial_line;
     size_t partial_length;
     size_t partial_capacity;
@@ -61,6 +67,7 @@ typedef struct {
     int running;
     History *history;
     KeyConfig shortcuts;
+    XClipboard clipboard;
 } App;
 
 static void redraw(App *app);
@@ -110,7 +117,7 @@ set_wakeup_fd_flags(int fd)
 }
 
 static void
-tab_init(Tab *tab, int wake_write_fd)
+tab_init(Tab *tab, int wake_write_fd, History *history)
 {
     memset(tab, 0, sizeof(*tab));
     tab->input_capacity = INPUT_INITIAL_CAPACITY;
@@ -120,6 +127,7 @@ tab_init(Tab *tab, int wake_write_fd)
     tab->shell = shell_create(wake_write_fd);
     if (tab->shell == NULL)
         fatal("create shell worker");
+    shell_set_history(tab->shell, history);
 }
 
 static void
@@ -132,6 +140,7 @@ tab_destroy(Tab *tab)
     free(tab->lines);
     free(tab->input);
     free(tab->partial_line);
+    free(tab->history_search_input);
     history_cursor_reset(&tab->history_cursor);
     shell_destroy(tab->shell);
     memset(tab, 0, sizeof(*tab));
@@ -218,7 +227,7 @@ app_add_tab(App *app)
     Tab **grown;
     if (tab == NULL)
         fatal("calloc tab");
-    tab_init(tab, app->wake_write_fd);
+    tab_init(tab, app->wake_write_fd, app->history);
     grown = realloc(app->tabs, (app->tab_count + 1) * sizeof(*grown));
     if (grown == NULL)
         fatal("realloc tabs");
@@ -416,7 +425,12 @@ static void
 draw_input(App *app)
 {
     Tab *tab = app->tabs[app->active_tab];
-    const char *prompt = "user@terminator> ";
+    const char *prompt = tab->history_search_active ? "Enter search term: " : "user@terminator> ";
+    char empty_search_input[1] = {0};
+    char *input = tab->history_search_active ?
+        (tab->history_search_input == NULL ? empty_search_input : tab->history_search_input) : tab->input;
+    size_t input_length = tab->history_search_active ? tab->history_search_length : tab->input_length;
+    size_t cursor = tab->history_search_active ? input_length : tab->cursor;
     int baseline = (int)app->height - (INPUT_HEIGHT - font_height(app)) / 2 - 3;
     int prompt_width = text_width(app, prompt);
     int available = (int)app->width - prompt_width - 18;
@@ -432,26 +446,26 @@ draw_input(App *app)
 
     if (available < 1)
         available = 1;
-    if (tab->cursor > 0) {
-        while (first < tab->cursor &&
-               text_width(app, tab->input + first) > available)
+    if (cursor > 0) {
+        while (first < cursor &&
+               text_width(app, input + first) > available)
             ++first;
     }
-    visible = tab->input + first;
+    visible = input + first;
     XSetForeground(app->display, app->gc, 0xe5e9f0);
     XDrawString(app->display, app->window, app->gc, 10 + prompt_width, baseline,
-                visible, (int)strlen(visible));
+                visible, (int)(input_length - first));
 
-    if (tab->cursor >= first) {
-        char saved = tab->input[tab->cursor];
-        tab->input[tab->cursor] = '\0';
+    if (cursor >= first) {
+        char saved = input[cursor];
+        input[cursor] = '\0';
         XSetForeground(app->display, app->gc, 0xebcb8b);
         XDrawLine(app->display, app->window, app->gc,
-                  10 + prompt_width + text_width(app, tab->input + first),
+                  10 + prompt_width + text_width(app, input + first),
                   baseline - app->font->ascent,
-                  10 + prompt_width + text_width(app, tab->input + first),
+                  10 + prompt_width + text_width(app, input + first),
                   baseline + app->font->descent);
-        tab->input[tab->cursor] = saved;
+        input[cursor] = saved;
     }
 }
 
@@ -536,6 +550,56 @@ history_next(App *app, Tab *tab)
         replace_input(tab, entry);
         free(entry);
     }
+}
+
+static void
+history_search_finish(App *app, Tab *tab)
+{
+    char **matches = NULL;
+    size_t count = 0;
+    const char *term = tab->history_search_input == NULL ? "" : tab->history_search_input;
+    char *header;
+    size_t header_size = strlen("Enter search term: \n") + strlen(term) + 1;
+    header = malloc(header_size);
+    if (header != NULL) {
+        (void)snprintf(header, header_size, "Enter search term: %s\n", term);
+        tab_append_line(tab, header);
+        free(header);
+    }
+    if (app->history == NULL || history_search(app->history, term, &matches, &count) < 0) {
+        tab_append_line(tab, "No match for search term in history");
+    } else if (count == 0) {
+        tab_append_line(tab, "No match for search term in history");
+    } else {
+        for (size_t i = 0; i < count; ++i) {
+            tab_append_line(tab, matches[i]);
+            free(matches[i]);
+        }
+        free(matches);
+    }
+    tab->history_search_active = 0;
+    if (tab->history_search_input != NULL)
+        tab->history_search_input[0] = '\0';
+    tab->history_search_length = 0;
+}
+
+static void
+history_search_append(Tab *tab, const char *bytes, size_t length)
+{
+    size_t needed = tab->history_search_length + length + 1;
+    if (needed > tab->history_search_capacity) {
+        size_t capacity = tab->history_search_capacity == 0 ? 64 : tab->history_search_capacity;
+        while (capacity < needed)
+            capacity *= 2;
+        char *grown = realloc(tab->history_search_input, capacity);
+        if (grown == NULL)
+            return;
+        tab->history_search_input = grown;
+        tab->history_search_capacity = capacity;
+    }
+    memcpy(tab->history_search_input + tab->history_search_length, bytes, length);
+    tab->history_search_length += length;
+    tab->history_search_input[tab->history_search_length] = '\0';
 }
 
 static int
@@ -732,6 +796,14 @@ submit_input(App *app, Tab *tab)
 }
 
 static void
+paste_into_active_input(void *context, const char *text, size_t length)
+{
+    App *app = context;
+    if (app->tab_count != 0 && !app->tabs[app->active_tab]->history_search_active)
+        input_insert(app->tabs[app->active_tab], text, length);
+}
+
+static void
 handle_key(App *app, XKeyEvent *event)
 {
     char bytes[64];
@@ -741,6 +813,80 @@ handle_key(App *app, XKeyEvent *event)
     int control = (event->state & ControlMask) != 0;
 
     ShortcutAction action = key_config_match(&app->shortcuts, symbol, event->state);
+    if (tab->history_search_active) {
+        if (symbol == XK_Escape) {
+            tab->history_search_active = 0;
+            tab->history_search_length = 0;
+            if (tab->history_search_input != NULL)
+                tab->history_search_input[0] = '\0';
+        } else if (symbol == XK_Return || symbol == XK_KP_Enter) {
+            history_search_finish(app, tab);
+        } else if (symbol == XK_BackSpace) {
+            if (tab->history_search_length != 0)
+                tab->history_search_input[--tab->history_search_length] = '\0';
+        } else if (!control && count > 0 && (unsigned char)bytes[0] >= 32) {
+            history_search_append(tab, bytes, (size_t)count);
+        }
+        return;
+    }
+    if (control && (symbol == XK_r || symbol == XK_R)) {
+        tab->history_search_active = 1;
+        tab->history_search_length = 0;
+        if (tab->history_search_input != NULL)
+            tab->history_search_input[0] = '\0';
+        history_navigation_reset(tab);
+        return;
+    }
+    if (control && (event->state & ShiftMask) != 0 &&
+        (symbol == XK_c || symbol == XK_C)) {
+        (void)xclipboard_copy(app->display, app->window, &app->clipboard,
+                              tab->input, tab->input_length);
+        return;
+    }
+    if (control && (event->state & ShiftMask) != 0 &&
+        (symbol == XK_v || symbol == XK_V)) {
+        xclipboard_paste(app->display, app->window, &app->clipboard);
+        return;
+    }
+    if (control && (symbol == XK_a || symbol == XK_A)) {
+        history_navigation_reset(tab);
+        editor_move_start(&tab->cursor);
+        return;
+    }
+    if (control && (symbol == XK_e || symbol == XK_E)) {
+        history_navigation_reset(tab);
+        editor_move_end(tab->input_length, &tab->cursor);
+        return;
+    }
+    if (control && (symbol == XK_u || symbol == XK_U)) {
+        history_navigation_reset(tab);
+        editor_kill_to_start(tab->input, &tab->input_length, &tab->cursor);
+        return;
+    }
+    if (control && (symbol == XK_k || symbol == XK_K)) {
+        history_navigation_reset(tab);
+        editor_kill_to_end(tab->input, &tab->input_length, &tab->cursor);
+        return;
+    }
+    if (control && (symbol == XK_w || symbol == XK_W)) {
+        history_navigation_reset(tab);
+        editor_kill_previous_word(tab->input, &tab->input_length, &tab->cursor);
+        return;
+    }
+    if (control && (symbol == XK_l || symbol == XK_L)) {
+        for (size_t i = 0; i < tab->line_count; ++i)
+            free(tab->lines[i]);
+        tab->line_count = 0;
+        tab->partial_length = 0;
+        if (tab->partial_line != NULL)
+            tab->partial_line[0] = '\0';
+        tab->scroll_rows = 0;
+        return;
+    }
+    if (control && (symbol == XK_d || symbol == XK_D)) {
+        app_close_tab(app, tab);
+        return;
+    }
     if (action == SHORTCUT_NEW_TAB) {
         app_add_tab(app);
         return;
@@ -859,6 +1005,12 @@ handle_button(App *app, XButtonEvent *event)
 static void
 handle_event(App *app, XEvent *event)
 {
+    if (xclipboard_handle_event(app->display, app->window, &app->clipboard,
+                                event, paste_into_active_input, app)) {
+        if (app->running && app->tab_count != 0)
+            redraw(app);
+        return;
+    }
     switch (event->type) {
     case Expose:
         if (event->xexpose.count == 0)
@@ -871,7 +1023,8 @@ handle_event(App *app, XEvent *event)
         break;
     case KeyPress:
         handle_key(app, &event->xkey);
-        redraw(app);
+        if (app->running && app->tab_count != 0)
+            redraw(app);
         break;
     case ButtonPress:
         if (event->xbutton.button == Button4 || event->xbutton.button == Button5) {
@@ -928,6 +1081,7 @@ app_init(App *app)
                                       40, 40, app->width, app->height, 1,
                                       BlackPixel(app->display, app->screen),
                                       0x1e222a);
+    xclipboard_init(app->display, &app->clipboard);
     XStoreName(app->display, app->window, "Terminator: A Custom Terminal");
     XSelectInput(app->display, app->window,
                  ExposureMask | KeyPressMask | ButtonPressMask | StructureNotifyMask);
@@ -963,7 +1117,7 @@ app_run(App *app)
     while (app->running) {
         struct pollfd fds[2];
         int result;
-        while (XPending(app->display) > 0) {
+        while (app->running && XPending(app->display) > 0) {
             XEvent event;
             XNextEvent(app->display, &event);
             handle_event(app, &event);
@@ -1001,6 +1155,7 @@ app_destroy(App *app)
     }
     free(app->tabs);
     history_close(app->history);
+    xclipboard_destroy(&app->clipboard);
     if (app->gc != 0)
         XFreeGC(app->display, app->gc);
     if (app->font != NULL)

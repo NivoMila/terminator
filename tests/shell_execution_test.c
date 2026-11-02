@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "shell.h"
+#include "history.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -98,10 +99,12 @@ int
 main(void)
 {
     char directory[] = "/tmp/terminator-stage4-XXXXXX";
+    char history_path[] = "/tmp/terminator-shell-history-XXXXXX";
     char path[512];
     char contents[256];
     int wake[2];
     Shell *shell;
+    History *history;
     Result result;
 
     assert(mkdtemp(directory) != NULL);
@@ -110,6 +113,15 @@ main(void)
     assert(flags >= 0 && fcntl(wake[0], F_SETFL, flags | O_NONBLOCK) == 0);
     shell = shell_create(wake[1]);
     assert(shell != NULL);
+    int history_fd = mkstemp(history_path);
+    assert(history_fd >= 0);
+    close(history_fd);
+    history = history_open(history_path);
+    assert(history != NULL && history_add(history, "previously-run") == 0);
+    shell_set_history(shell, history);
+    result = run_line(shell, wake[0], "history");
+    assert(strstr(result.data, "previously-run") != NULL);
+    free(result.data);
 
     expect_contains(shell, wake[0], "echo hello | wc -c", "6");
     expect_contains(shell, wake[0], "printf hello | wc -c", "5");
@@ -199,6 +211,8 @@ main(void)
     expect_contains(shell, wake[0], "seq 1 100000 | wc -l", "100000");
 
     shell_destroy(shell);
+    history_close(history);
+    assert(unlink(history_path) == 0);
     close(wake[0]);
     close(wake[1]);
 

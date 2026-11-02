@@ -37,7 +37,7 @@ void
 key_config_defaults(KeyConfig *config)
 {
     config->bindings[SHORTCUT_NEW_TAB] = (KeyBinding){XK_t, ControlMask};
-    config->bindings[SHORTCUT_CLOSE_TAB] = (KeyBinding){XK_w, ControlMask};
+    config->bindings[SHORTCUT_CLOSE_TAB] = (KeyBinding){XK_w, Mod1Mask};
     config->bindings[SHORTCUT_NEXT_TAB] = (KeyBinding){XK_Tab, ControlMask};
     config->bindings[SHORTCUT_PREVIOUS_TAB] =
         (KeyBinding){XK_Tab, ControlMask | ShiftMask};
@@ -106,9 +106,28 @@ parse_action(const char *name)
 }
 
 static int
+binding_reserved(KeyBinding binding)
+{
+    static const KeyBinding reserved[] = {
+        {XK_a, ControlMask}, {XK_e, ControlMask},
+        {XK_u, ControlMask}, {XK_k, ControlMask},
+        {XK_w, ControlMask}, {XK_l, ControlMask},
+        {XK_d, ControlMask}, {XK_r, ControlMask},
+        {XK_c, ControlMask | ShiftMask},
+        {XK_v, ControlMask | ShiftMask}
+    };
+    for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); ++i)
+        if (reserved[i].key == binding.key && reserved[i].modifiers == binding.modifiers)
+            return 1;
+    return 0;
+}
+
+static int
 binding_conflicts(const KeyConfig *config, ShortcutAction action, KeyBinding binding)
 {
     int i;
+    if (binding_reserved(binding))
+        return 1;
     for (i = 1; i < SHORTCUT_COUNT; ++i) {
         if (i != (int)action && config->bindings[i].key == binding.key &&
             config->bindings[i].modifiers == binding.modifiers)
