@@ -188,6 +188,55 @@ test_repeated_tab_transfer_and_tab_close(void)
     completion_selection_clear(&selection);
 }
 
+static void
+free_match_array(char **items, size_t count)
+{
+    for (size_t i = 0; i < count; ++i)
+        free(items[i]);
+    free(items);
+}
+
+static void
+test_unique_common_prefix_and_ambiguous_results(void)
+{
+    CompletionSelection selection;
+    char *input;
+    size_t capacity, length, cursor, count;
+    char **items;
+
+    completion_selection_init(&selection);
+    items = calloc(1, sizeof(*items));
+    assert(items != NULL);
+    items[0] = strdup("unique file.txt");
+    assert(items[0] != NULL);
+    count = 1;
+    input = strdup("cat uni"); capacity = strlen(input) + 1;
+    length = strlen(input); cursor = length;
+    assert(completion_apply_matches(&selection, &items, &count, "uni", 4,
+        &input, &capacity, &length, &cursor) == COMPLETION_APPLY_INSERTED);
+    assert(strcmp(input, "cat unique\\ file.txt") == 0);
+    free_match_array(items, count);
+    free(input);
+
+    items = matches("apple-one", "apple-two"); count = 2;
+    input = strdup("cat app"); capacity = strlen(input) + 1;
+    length = strlen(input); cursor = length;
+    assert(completion_apply_matches(&selection, &items, &count, "app", 4,
+        &input, &capacity, &length, &cursor) == COMPLETION_APPLY_INSERTED);
+    assert(strcmp(input, "cat apple-") == 0);
+    free_match_array(items, count);
+    free(input);
+
+    items = matches("alpha", "bravo"); count = 2;
+    input = strdup("cat "); capacity = strlen(input) + 1;
+    length = strlen(input); cursor = length;
+    assert(completion_apply_matches(&selection, &items, &count, "", 4,
+        &input, &capacity, &length, &cursor) == COMPLETION_APPLY_SELECTING);
+    assert(items == NULL && count == 0 && selection.count == 2);
+    completion_selection_clear(&selection);
+    free(input);
+}
+
 int
 main(void)
 {
@@ -196,6 +245,7 @@ main(void)
     test_rest_of_line_is_preserved();
     test_long_number_and_tab_isolation();
     test_repeated_tab_transfer_and_tab_close();
+    test_unique_common_prefix_and_ambiguous_results();
     puts("completion selection tests passed");
     return 0;
 }

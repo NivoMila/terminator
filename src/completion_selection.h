@@ -19,6 +19,13 @@ typedef enum {
     COMPLETION_SELECTION_CANCELLED
 } CompletionSelectionResult;
 
+typedef enum {
+    COMPLETION_APPLY_ERROR = -1,
+    COMPLETION_APPLY_NONE = 0,
+    COMPLETION_APPLY_INSERTED = 1,
+    COMPLETION_APPLY_SELECTING = 2
+} CompletionApplyResult;
+
 void completion_selection_init(CompletionSelection *selection);
 void completion_selection_clear(CompletionSelection *selection);
 /* On success, atomically takes matches/count and resets the caller's values. */
@@ -31,5 +38,10 @@ const char *completion_selection_match(const CompletionSelection *selection,
 int completion_selection_apply(const CompletionSelection *selection, size_t index,
                                char **input, size_t *capacity, size_t *length,
                                size_t *cursor);
+/* Extends a unique/common prefix or transfers ambiguous matches to selection. */
+CompletionApplyResult completion_apply_matches(
+    CompletionSelection *selection, char ***matches, size_t *match_count,
+    const char *prefix, size_t start, char **input, size_t *capacity,
+    size_t *length, size_t *cursor);
 
 #endif

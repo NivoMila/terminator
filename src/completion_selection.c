@@ -212,3 +212,46 @@ completion_selection_apply(const CompletionSelection *selection, size_t index,
     free(encoded);
     return 0;
 }
+
+CompletionApplyResult
+completion_apply_matches(CompletionSelection *selection, char ***matches,
+                         size_t *match_count, const char *prefix, size_t start,
+                         char **input, size_t *capacity, size_t *length,
+                         size_t *cursor)
+{
+    size_t common, prefix_length, i;
+    CompletionSelection view = {0};
+
+    if (selection == NULL || matches == NULL || match_count == NULL ||
+        prefix == NULL || input == NULL || capacity == NULL || length == NULL ||
+        cursor == NULL)
+        return COMPLETION_APPLY_ERROR;
+    if (*match_count == 0 || *matches == NULL)
+        return COMPLETION_APPLY_NONE;
+    for (i = 0; i < *match_count; ++i)
+        if ((*matches)[i] == NULL)
+            return COMPLETION_APPLY_ERROR;
+
+    common = strlen((*matches)[0]);
+    for (i = 1; i < *match_count; ++i) {
+        size_t j = 0;
+        while (j < common && (*matches)[0][j] == (*matches)[i][j])
+            ++j;
+        common = j;
+    }
+    prefix_length = strlen(prefix);
+    if (*match_count > 1 && common <= prefix_length) {
+        if (completion_selection_begin(selection, matches, match_count, start) < 0)
+            return COMPLETION_APPLY_ERROR;
+        return COMPLETION_APPLY_SELECTING;
+    }
+
+    if (*match_count > 1)
+        (*matches)[0][common] = '\0';
+    view.matches = *matches;
+    view.count = *match_count;
+    view.start = start;
+    if (completion_selection_apply(&view, 0, input, capacity, length, cursor) < 0)
+        return COMPLETION_APPLY_ERROR;
+    return COMPLETION_APPLY_INSERTED;
+}

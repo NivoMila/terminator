@@ -84,6 +84,8 @@ int main(void){
  r=run(s,wake[0],"bash no-export.sh");assert(strstr(r.text,"still-running"));assert(strstr(r.text,"hidden")==NULL);free(r.text);
  snprintf(path,sizeof(path),"%s/assignment.sh",dir);write_script(path,"BASE=\"two words\"; COPY=$BASE; echo \"$COPY\"\nif [ \"$(printf 2)\" -eq 2 ]; then echo substitution-test; fi\n");
  r=run(s,wake[0],"bash assignment.sh");if(!strstr(r.text,"two words"))fprintf(stderr,"assignment output [%s] status %d\n",r.text,r.status);assert(strstr(r.text,"two words"));assert(strstr(r.text,"substitution-test"));free(r.text);
+ snprintf(path,sizeof(path),"%s/string-test.sh",dir);write_script(path,"if [ \"alpha\" = \"alpha\" ]; then echo string-equal; else echo wrong-equal; fi\nif [[ \"alpha\" = \"beta\" ]]; then echo wrong-unequal; else echo string-unequal; fi\n");
+ r=run(s,wake[0],"bash string-test.sh");assert(strstr(r.text,"string-equal"));assert(strstr(r.text,"string-unequal"));assert(strstr(r.text,"wrong-")==NULL);free(r.text);
  snprintf(path,sizeof(path),"%s/stderr-subst.sh",dir);write_script(path,"echo \"$(terminator-command-that-does-not-exist)\"; echo after-error\n");
  r=run(s,wake[0],"bash stderr-subst.sh");assert(strstr(r.text,"terminator-command-that-does-not-exist"));assert(strstr(r.text,"after-error"));free(r.text);
 

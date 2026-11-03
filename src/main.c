@@ -7,6 +7,7 @@
 #include "xclipboard.h"
 #include "interactive_input.h"
 #include "completion_selection.h"
+#include "process_runtime.h"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -51,6 +52,14 @@ typedef struct {
     size_t partial_length;
     size_t partial_capacity;
     Shell *shell;
+    uint32_t id;
+    int process_mode;
+    uint64_t pending_completion_id;
+    char *pending_completion_input;
+    char *pending_completion_prefix;
+    size_t pending_completion_length;
+    size_t pending_completion_cursor;
+    size_t pending_completion_start;
     int busy;
 } Tab;
 
@@ -72,10 +81,16 @@ typedef struct {
     History *history;
     KeyConfig shortcuts;
     XClipboard clipboard;
+    int process_mode;
+    int x11_fd;
+    uint32_t next_tab_id;
 } App;
 
 static void redraw(App *app);
 static void history_navigation_reset(Tab *tab);
+static CompletionApplyResult completion_apply_matches_to_tab(
+    Tab *tab, const char *prefix, size_t start, char ***matches, size_t *count);
+static void completion_pending_clear(Tab *tab);
 
 static void
 fatal(const char *message)
@@ -121,14 +136,19 @@ set_wakeup_fd_flags(int fd)
 }
 
 static void
-tab_init(Tab *tab, int wake_write_fd, History *history)
+tab_init(Tab *tab, int wake_write_fd, History *history, int process_mode,
+         int x11_fd, uint32_t tab_id)
 {
     memset(tab, 0, sizeof(*tab));
     tab->input_capacity = INPUT_INITIAL_CAPACITY;
     tab->input = calloc(tab->input_capacity, 1);
     if (tab->input == NULL)
         fatal("calloc input");
-    tab->shell = shell_create(wake_write_fd);
+    tab->id = tab_id;
+    tab->process_mode = process_mode;
+    tab->shell = process_mode ?
+        shell_create_process(wake_write_fd, x11_fd, tab_id) :
+        shell_create(wake_write_fd);
     if (tab->shell == NULL)
         fatal("create shell worker");
     shell_set_history(tab->shell, history);
@@ -146,6 +166,8 @@ tab_destroy(Tab *tab)
     free(tab->input);
     free(tab->partial_line);
     free(tab->history_search_input);
+    free(tab->pending_completion_input);
+    free(tab->pending_completion_prefix);
     history_cursor_reset(&tab->history_cursor);
     interactive_input_destroy(&tab->multiline_input);
     completion_selection_clear(&tab->completion_selection);
@@ -234,7 +256,13 @@ app_add_tab(App *app)
     Tab **grown;
     if (tab == NULL)
         fatal("calloc tab");
-    tab_init(tab, app->wake_write_fd, app->history);
+    if (app->next_tab_id == UINT32_MAX) {
+        free(tab);
+        errno = EOVERFLOW;
+        fatal("tab ID exhausted");
+    }
+    tab_init(tab, app->wake_write_fd, app->history, app->process_mode,
+             app->x11_fd, ++app->next_tab_id);
     grown = realloc(app->tabs, (app->tab_count + 1) * sizeof(*grown));
     if (grown == NULL)
         fatal("realloc tabs");
@@ -315,6 +343,22 @@ drain_shell_events(App *app)
             else if (event.type == SHELL_EVENT_COMMAND_DONE) {
                 tab_flush_partial(tab);
                 tab->busy = 0;
+            } else if (event.type == SHELL_EVENT_COMPLETION) {
+                if (tab->pending_completion_id == event.request_id) {
+                    int input_unchanged =
+                        tab->input_length == tab->pending_completion_length &&
+                        tab->cursor == tab->pending_completion_cursor &&
+                        tab->pending_completion_input != NULL &&
+                        memcmp(tab->input, tab->pending_completion_input,
+                               tab->input_length) == 0;
+                    if (event.status == 0 && input_unchanged) {
+                        (void)completion_apply_matches_to_tab(
+                            tab, tab->pending_completion_prefix,
+                            tab->pending_completion_start, &event.matches,
+                            &event.match_count);
+                    }
+                    completion_pending_clear(tab);
+                }
             } else if (event.type == SHELL_EVENT_EXIT) {
                 close_tab = 1;
             }
@@ -694,24 +738,51 @@ decode_word_prefix(const char *input, size_t start, size_t end)
     return decoded;
 }
 
-static char *
-escape_word(const char *word)
+static void
+completion_show_candidates(Tab *tab)
 {
-    size_t length = strlen(word);
-    char *escaped = malloc(length * 2 + 1);
-    size_t used = 0;
     size_t i;
-    if (escaped == NULL)
-        return NULL;
-    for (i = 0; i < length; ++i) {
-        char c = word[i];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\\' ||
-            c == '\'' || c == '"' || c == '|' || c == '<' || c == '>' || c == '&')
-            escaped[used++] = '\\';
-        escaped[used++] = c;
+    for (i = 0; i < tab->completion_selection.count; ++i) {
+        char *line;
+        int needed = snprintf(NULL, 0, "%zu. %s", i + 1,
+                              completion_selection_match(
+                                  &tab->completion_selection, i));
+        if (needed < 0)
+            continue;
+        line = malloc((size_t)needed + 1);
+        if (line == NULL)
+            fatal("malloc completion list line");
+        (void)snprintf(line, (size_t)needed + 1, "%zu. %s", i + 1,
+                       completion_selection_match(
+                           &tab->completion_selection, i));
+        tab_append_line(tab, line);
+        free(line);
     }
-    escaped[used] = '\0';
-    return escaped;
+}
+
+static CompletionApplyResult
+completion_apply_matches_to_tab(Tab *tab, const char *prefix, size_t start,
+                                char ***matches, size_t *count)
+{
+    CompletionApplyResult result = completion_apply_matches(
+        &tab->completion_selection, matches, count, prefix, start,
+        &tab->input, &tab->input_capacity, &tab->input_length, &tab->cursor);
+    if (result == COMPLETION_APPLY_SELECTING)
+        completion_show_candidates(tab);
+    return result;
+}
+
+static void
+completion_pending_clear(Tab *tab)
+{
+    tab->pending_completion_id = 0;
+    free(tab->pending_completion_input);
+    tab->pending_completion_input = NULL;
+    free(tab->pending_completion_prefix);
+    tab->pending_completion_prefix = NULL;
+    tab->pending_completion_length = 0;
+    tab->pending_completion_cursor = 0;
+    tab->pending_completion_start = 0;
 }
 
 static void
@@ -721,12 +792,7 @@ complete_input(Tab *tab)
     char *prefix;
     char **matches = NULL;
     size_t count = 0;
-    size_t common;
-    size_t i;
-    const char *replacement;
-    char *encoded;
-    size_t old_length;
-    size_t new_length;
+    CompletionApplyResult applied;
 
     history_navigation_reset(tab);
     if (tab->cursor > tab->input_length)
@@ -735,58 +801,38 @@ complete_input(Tab *tab)
     prefix = decode_word_prefix(tab->input, start, tab->cursor);
     if (prefix == NULL)
         return;
+    if (tab->process_mode) {
+        char *input_snapshot = strdup(tab->input);
+        char *prefix_snapshot = strdup(prefix);
+        uint64_t request_id;
+        if (input_snapshot == NULL || prefix_snapshot == NULL) {
+            free(input_snapshot);
+            free(prefix_snapshot);
+            free(prefix);
+            return;
+        }
+        if (shell_request_completion(tab->shell, prefix, &request_id) == 0) {
+            completion_pending_clear(tab);
+            tab->pending_completion_id = request_id;
+            tab->pending_completion_input = input_snapshot;
+            tab->pending_completion_prefix = prefix_snapshot;
+            tab->pending_completion_length = tab->input_length;
+            tab->pending_completion_cursor = tab->cursor;
+            tab->pending_completion_start = start;
+        } else {
+            free(input_snapshot);
+            free(prefix_snapshot);
+        }
+        free(prefix);
+        return;
+    }
     if (shell_complete_path(tab->shell, prefix, &matches, &count) < 0 || count == 0) {
         free(prefix);
         shell_completion_free(matches, count);
         return;
     }
-    common = strlen(matches[0]);
-    for (i = 1; i < count; ++i) {
-        size_t j = 0;
-        while (j < common && matches[0][j] == matches[i][j])
-            ++j;
-        common = j;
-    }
-    if (count == 1 || common > strlen(prefix)) {
-        if (count == 1)
-            replacement = matches[0];
-        else {
-            matches[0][common] = '\0';
-            replacement = matches[0];
-        }
-        encoded = escape_word(replacement);
-        if (encoded != NULL) {
-            old_length = tab->cursor - start;
-            new_length = strlen(encoded);
-            input_reserve(tab, tab->input_length - old_length + new_length + 1);
-            memmove(tab->input + start + new_length, tab->input + tab->cursor,
-                    tab->input_length - tab->cursor + 1);
-            memcpy(tab->input + start, encoded, new_length);
-            tab->input_length = tab->input_length - old_length + new_length;
-            tab->cursor = start + new_length;
-            free(encoded);
-        }
-    } else {
-        if (completion_selection_begin(&tab->completion_selection, &matches,
-                                       &count, start) == 0) {
-            for (i = 0; i < tab->completion_selection.count; ++i) {
-                char *line;
-                int needed = snprintf(NULL, 0, "%zu. %s", i + 1,
-                                      completion_selection_match(
-                                          &tab->completion_selection, i));
-                if (needed < 0)
-                    continue;
-                line = malloc((size_t)needed + 1);
-                if (line == NULL)
-                    fatal("malloc completion list line");
-                (void)snprintf(line, (size_t)needed + 1, "%zu. %s", i + 1,
-                               completion_selection_match(
-                                   &tab->completion_selection, i));
-                tab_append_line(tab, line);
-                free(line);
-            }
-        }
-    }
+    applied = completion_apply_matches_to_tab(tab, prefix, start, &matches, &count);
+    (void)applied;
     free(prefix);
     shell_completion_free(matches, count);
 }
@@ -833,14 +879,16 @@ submit_input(App *app, Tab *tab)
                                  error.offset, error.message);
             if (count > 0)
                 tab_append_line(tab, message);
-            if (app->history != NULL && command[0] != '\0')
-                (void)history_add(app->history, command);
+            if (app->history != NULL && command[0] != '\0' &&
+                history_add(app->history, command) < 0)
+                tab_append_line(tab, "terminator: unable to persist history entry");
         } else {
             tab_append_line(tab, "terminator: unable to parse command");
         }
     } else if (shell_submit(tab->shell, command) == 0) {
-        if (app->history != NULL && command[0] != '\0')
-            (void)history_add(app->history, command);
+        if (app->history != NULL && command[0] != '\0' &&
+            history_add(app->history, command) < 0)
+            tab_append_line(tab, "terminator: unable to persist history entry");
         if (command[0] != '\0')
             tab->busy = 1;
     } else {
@@ -938,6 +986,10 @@ handle_key(App *app, XKeyEvent *event)
         /* Other shortcuts and ordinary editing cancel selection and retain
          * their normal meaning. */
         completion_selection_clear(&tab->completion_selection);
+    }
+    if (symbol == XK_Escape && tab->pending_completion_id != 0) {
+        completion_pending_clear(tab);
+        return;
     }
     if (control && (symbol == XK_r || symbol == XK_R)) {
         tab->history_search_active = 1;
@@ -1161,7 +1213,7 @@ handle_event(App *app, XEvent *event)
 }
 
 static void
-app_init(App *app)
+app_init(App *app, int process_mode)
 {
     XSizeHints hints;
     int wake_pipe[2];
@@ -1169,13 +1221,19 @@ app_init(App *app)
     memset(app, 0, sizeof(*app));
     app->wake_read_fd = -1;
     app->wake_write_fd = -1;
+    app->process_mode = process_mode;
+    app->x11_fd = -1;
     if (pipe(wake_pipe) < 0)
         fatal("pipe wakeup");
     app->wake_read_fd = wake_pipe[0];
     app->wake_write_fd = wake_pipe[1];
     set_wakeup_fd_flags(app->wake_read_fd);
     set_wakeup_fd_flags(app->wake_write_fd);
-    app->history = history_open(NULL);
+    app->history = process_mode ? history_open_process_shared(NULL) :
+                                  history_open(NULL);
+    if (app->history == NULL)
+        (void)fprintf(stderr, "terminator: history unavailable: %s\n",
+                      strerror(errno));
     (void)key_config_load(&app->shortcuts, NULL);
     app->display = XOpenDisplay(NULL);
     if (app->display == NULL) {
@@ -1183,6 +1241,7 @@ app_init(App *app)
         exit(EXIT_FAILURE);
     }
     set_close_on_exec(ConnectionNumber(app->display));
+    app->x11_fd = ConnectionNumber(app->display);
     app->screen = DefaultScreen(app->display);
     app->width = WINDOW_WIDTH;
     app->height = WINDOW_HEIGHT;
@@ -1214,7 +1273,8 @@ app_init(App *app)
     }
 
     app_add_tab(app);
-    tab_append_line(app->tabs[0], "Thread-mode shell ready.");
+    tab_append_line(app->tabs[0], process_mode ?
+                    "Process-mode shell ready." : "Thread-mode shell ready.");
     tab_append_line(app->tabs[0],
                     "Commands: cd, pwd, jobs, fg, bg, &, and external programs.");
     XMapWindow(app->display, app->window);
@@ -1281,10 +1341,17 @@ app_destroy(App *app)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
     App app;
-    app_init(&app);
+    int process_mode;
+    if (process_runtime_is_child_invocation(argc, argv))
+        return process_runtime_child_entry(argc, argv);
+    if (process_runtime_parse_args(argc, argv, &process_mode) < 0) {
+        (void)fprintf(stderr, "usage: %s [useProcess=True]\n", argv[0]);
+        return 2;
+    }
+    app_init(&app, process_mode);
     app_run(&app);
     app_destroy(&app);
     return EXIT_SUCCESS;

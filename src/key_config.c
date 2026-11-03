@@ -175,16 +175,21 @@ key_config_load(KeyConfig *config, const char *path)
         if (*entry == '\0')
             continue;
         equals = strchr(entry, '=');
-        if (equals == NULL)
+        if (equals == NULL) {
+            fprintf(stderr, "terminator: ignoring invalid shortcut entry: %s\n", entry);
             continue;
+        }
         *equals = '\0';
         action_name = trim(entry);
         chord = trim(equals + 1);
         action = parse_action(action_name);
         if (action == SHORTCUT_NONE || *chord == '\0' ||
             parse_chord(chord, &binding) < 0 ||
-            binding_conflicts(config, action, binding))
+            binding_conflicts(config, action, binding)) {
+            fprintf(stderr, "terminator: ignoring invalid or conflicting shortcut: %s\n",
+                    action_name);
             continue;
+        }
         config->bindings[action] = binding;
         ++accepted;
     }

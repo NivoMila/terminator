@@ -14,16 +14,106 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 enum { OUTPUT_CHUNK = 4096 };
 
-extern char **environ;
+static char *
+absolute_from_cwd(const ShellState *shell, const char *path, size_t path_length)
+{
+    size_t cwd_length;
+    char *result;
+
+    if (path_length > 0 && path[0] == '/')
+        return strndup(path, path_length);
+    cwd_length = strlen(shell->cwd_path);
+    if (path_length > SIZE_MAX - 2 || cwd_length > SIZE_MAX - path_length - 2) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    result = malloc(cwd_length + path_length + 2);
+    if (result == NULL)
+        return NULL;
+    memcpy(result, shell->cwd_path, cwd_length);
+    result[cwd_length] = '/';
+    memcpy(result + cwd_length + 1, path, path_length);
+    result[cwd_length + path_length + 1] = '\0';
+    return result;
+}
+
+static char *
+join_directory_command(const char *directory, const char *command)
+{
+    size_t directory_length = strlen(directory);
+    size_t command_length = strlen(command);
+    int needs_slash = directory_length == 0 || directory[directory_length - 1] != '/';
+    char *result;
+
+    if (directory_length > SIZE_MAX - command_length - (size_t)needs_slash - 1) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    result = malloc(directory_length + (size_t)needs_slash + command_length + 1);
+    if (result == NULL)
+        return NULL;
+    memcpy(result, directory, directory_length);
+    if (needs_slash)
+        result[directory_length++] = '/';
+    memcpy(result + directory_length, command, command_length + 1);
+    return result;
+}
+
+/* Preflight preserves the shell's distinct not-found (127) and
+ * non-executable (126) statuses. execvp() still performs the actual lookup. */
+static char *
+resolve_executable(const ShellState *shell, const char *command)
+{
+    const char *path_value;
+    const char *component;
+    int saw_access_denied = 0;
+
+    if (strchr(command, '/') != NULL)
+        return absolute_from_cwd(shell, command, strlen(command));
+
+    path_value = getenv("PATH");
+    if (path_value == NULL)
+        path_value = "/bin:/usr/bin";
+    component = path_value;
+    for (;;) {
+        const char *end = strchr(component, ':');
+        size_t length = end == NULL ? strlen(component) : (size_t)(end - component);
+        char *directory = length == 0
+            ? strdup(shell->cwd_path)
+            : absolute_from_cwd(shell, component, length);
+        char *candidate;
+        struct stat candidate_stat;
+
+        if (directory == NULL)
+            return NULL;
+        candidate = join_directory_command(directory, command);
+        free(directory);
+        if (candidate == NULL)
+            return NULL;
+        if (access(candidate, X_OK) == 0 &&
+            stat(candidate, &candidate_stat) == 0 &&
+            !S_ISDIR(candidate_stat.st_mode))
+            return candidate;
+        if (errno == EACCES)
+            saw_access_denied = 1;
+        free(candidate);
+        if (end == NULL)
+            break;
+        component = end + 1;
+    }
+    errno = saw_access_denied ? EACCES : ENOENT;
+    return NULL;
+}
 
 static void
-emit_output(Shell *shell, const char *text, size_t length)
+emit_output(ShellState *shell, const char *text, size_t length)
 {
     if (length == 0) return;
     if (shell->capturing_output) {
@@ -106,98 +196,8 @@ make_pipe_above_stdio(int pipe_fds[2])
     return 0;
 }
 
-static char *
-absolute_from_cwd(const Shell *shell, const char *path, size_t path_length)
-{
-    size_t cwd_length;
-    char *result;
-
-    if (path_length > 0 && path[0] == '/')
-        return strndup(path, path_length);
-    cwd_length = strlen(shell->cwd_path);
-    if (path_length > SIZE_MAX - 2 || cwd_length > SIZE_MAX - path_length - 2) {
-        errno = ENAMETOOLONG;
-        return NULL;
-    }
-    result = malloc(cwd_length + path_length + 2);
-    if (result == NULL)
-        return NULL;
-    memcpy(result, shell->cwd_path, cwd_length);
-    result[cwd_length] = '/';
-    memcpy(result + cwd_length + 1, path, path_length);
-    result[cwd_length + path_length + 1] = '\0';
-    return result;
-}
-
-static char *
-join_directory_command(const char *directory, const char *command)
-{
-    size_t directory_length = strlen(directory);
-    size_t command_length = strlen(command);
-    int needs_slash = directory_length == 0 || directory[directory_length - 1] != '/';
-    char *result;
-
-    if (directory_length > SIZE_MAX - command_length - (size_t)needs_slash - 1) {
-        errno = ENAMETOOLONG;
-        return NULL;
-    }
-    result = malloc(directory_length + (size_t)needs_slash + command_length + 1);
-    if (result == NULL)
-        return NULL;
-    memcpy(result, directory, directory_length);
-    if (needs_slash)
-        result[directory_length++] = '/';
-    memcpy(result + directory_length, command, command_length + 1);
-    return result;
-}
-
-/* Resolve PATH in the parent, where allocation and access checks are safe. */
-static char *
-resolve_executable(const Shell *shell, const char *command)
-{
-    const char *path_value;
-    const char *component;
-    int saw_access_denied = 0;
-
-    if (strchr(command, '/') != NULL)
-        return absolute_from_cwd(shell, command, strlen(command));
-
-    path_value = getenv("PATH");
-    if (path_value == NULL)
-        path_value = "/bin:/usr/bin";
-    component = path_value;
-    for (;;) {
-        const char *end = strchr(component, ':');
-        size_t length = end == NULL ? strlen(component) : (size_t)(end - component);
-        char *directory = length == 0
-            ? strdup(shell->cwd_path)
-            : absolute_from_cwd(shell, component, length);
-        char *candidate;
-        struct stat candidate_stat;
-
-        if (directory == NULL)
-            return NULL;
-        candidate = join_directory_command(directory, command);
-        free(directory);
-        if (candidate == NULL)
-            return NULL;
-        if (access(candidate, X_OK) == 0 &&
-            stat(candidate, &candidate_stat) == 0 &&
-            !S_ISDIR(candidate_stat.st_mode))
-            return candidate;
-        if (errno == EACCES)
-            saw_access_denied = 1;
-        free(candidate);
-        if (end == NULL)
-            break;
-        component = end + 1;
-    }
-    errno = saw_access_denied ? EACCES : ENOENT;
-    return NULL;
-}
-
 static int
-emit_error(Shell *shell, const char *prefix, const char *detail)
+emit_error(ShellState *shell, const char *prefix, const char *detail)
 {
     char message[1024];
     int count = snprintf(message, sizeof(message), "terminator: %s: %s\n",
@@ -213,7 +213,7 @@ emit_error(Shell *shell, const char *prefix, const char *detail)
 }
 
 static int
-set_cwd(Shell *shell, const char *path)
+set_cwd(ShellState *shell, const char *path)
 {
     int new_fd;
     char proc_path[64];
@@ -303,10 +303,30 @@ job_is_stopped(const ShellJob *job)
     return any_stopped;
 }
 
-static int wait_for_job(Shell *shell, ShellJob *job);
+static void
+emit_job_state(ShellState *shell, const ShellJob *job, unsigned char state)
+{
+    unsigned char payload[16] = {0};
+    uint64_t pgid;
+    if (!shell->process_backend)
+        return;
+    pgid = (uint64_t)job->pgid;
+    payload[0] = (unsigned char)(job->id >> 24);
+    payload[1] = (unsigned char)(job->id >> 16);
+    payload[2] = (unsigned char)(job->id >> 8);
+    payload[3] = (unsigned char)job->id;
+    for (unsigned n = 0; n < 8; ++n)
+        payload[4 + n] = (unsigned char)(pgid >> (56 - n * 8));
+    payload[12] = state;
+    payload[13] = (unsigned char)(job->foreground != 0);
+    (void)shell_emit(shell, SHELL_EVENT_JOB_STATE,
+                     (const char *)payload, sizeof(payload), state);
+}
+
+static int wait_for_job(ShellState *shell, ShellJob *job);
 
 static void
-job_drain_output(Shell *shell, ShellJob *job)
+job_drain_output(ShellState *shell, ShellJob *job)
 {
     char buffer[OUTPUT_CHUNK];
     unsigned chunks = 0;
@@ -318,12 +338,12 @@ job_drain_output(Shell *shell, ShellJob *job)
             if (job->multiwatch) {
                 char header[1200];
                 time_t now = time(NULL);
-                int n = snprintf(header, sizeof(header), "\"%s\", %lld:\n--------------------\n",
+                int n = snprintf(header, sizeof(header), "\"%s\", %lld:\n----------------------------------------------------\n",
                                  job->command, (long long)now);
                 if (n > 0)
                     emit_output(shell, header, (size_t)n < sizeof(header) ? (size_t)n : sizeof(header) - 1);
                 emit_output(shell, buffer, (size_t)amount);
-                emit_output(shell, "\n--------------------\n", sizeof("\n--------------------\n") - 1);
+                emit_output(shell, "\n----------------------------------------------------\n", sizeof("\n----------------------------------------------------\n") - 1);
                 job->multiwatch_output_bytes += (size_t)amount;
             } else {
                 emit_output(shell, buffer, (size_t)amount);
@@ -346,7 +366,7 @@ job_drain_output(Shell *shell, ShellJob *job)
 }
 
 static void
-job_drain_stderr(Shell *shell, ShellJob *job)
+job_drain_stderr(ShellState *shell, ShellJob *job)
 {
     char buffer[OUTPUT_CHUNK];
     unsigned chunks = 0;
@@ -368,7 +388,7 @@ job_drain_stderr(Shell *shell, ShellJob *job)
 }
 
 static void
-job_check_children(Shell *shell, ShellJob *job)
+job_check_children(ShellState *shell, ShellJob *job)
 {
     size_t i;
     for (i = 0; i < job->count; ++i) {
@@ -389,6 +409,7 @@ job_check_children(Shell *shell, ShellJob *job)
             }
             continue;
         }
+        unsigned char old_state = job->states[i];
         if (WIFSTOPPED(status)) {
             job->states[i] = 1;
         } else if (WIFCONTINUED(status)) {
@@ -409,7 +430,7 @@ job_check_children(Shell *shell, ShellJob *job)
                     int length;
                     if (job->multiwatch)
                         length = snprintf(message, sizeof(message),
-                                          "\"%s\", %lld:\n--------------------\nterminator: stage %zu: %s\n--------------------\n",
+                                          "\"%s\", %lld:\n----------------------------------------------------\nterminator: stage %zu: %s\n----------------------------------------------------\n",
                                           job->command, (long long)time(NULL), i + 1, strerror(exec_errno));
                     else
                         length = snprintf(message, sizeof(message), "terminator: job %u stage %zu: %s\n",
@@ -427,13 +448,18 @@ job_check_children(Shell *shell, ShellJob *job)
                 }
             }
         }
+        if (job->states[i] != old_state && shell->process_backend) {
+            if (job_is_stopped(job) || job->remaining == 0)
+                job->foreground = 0;
+            emit_job_state(shell, job, job->states[i]);
+        }
     }
     if (job->remaining == 0) {
         job_drain_output(shell, job);
         job_drain_stderr(shell, job);
         if (job->multiwatch && job->multiwatch_output_bytes == 0) {
             char message[1200];
-            int n = snprintf(message, sizeof(message), "\"%s\", %lld:\n--------------------\n(no output; exit status %d)\n--------------------\n",
+            int n = snprintf(message, sizeof(message), "\"%s\", %lld:\n----------------------------------------------------\n(no output; exit status %d)\n----------------------------------------------------\n",
                              job->command, (long long)time(NULL), job->last_status);
             if (n > 0)
                 emit_output(shell, message, (size_t)n < sizeof(message) ? (size_t)n : sizeof(message) - 1);
@@ -455,7 +481,7 @@ job_check_children(Shell *shell, ShellJob *job)
 }
 
 void
-execute_reap_jobs(Shell *shell)
+execute_reap_jobs(ShellState *shell)
 {
     ShellJob *job;
     for (job = shell->jobs; job != NULL; job = job->next) {
@@ -519,7 +545,7 @@ move_above_stdio(int *fd)
 }
 
 static int
-open_redirection(Shell *shell, const Redirection *redirection)
+open_redirection(ShellState *shell, const Redirection *redirection)
 {
     int fd;
     int flags;
@@ -543,7 +569,7 @@ open_redirection(Shell *shell, const Redirection *redirection)
 }
 
 static int
-run_pipeline(Shell *shell, Pipeline *pipeline, const char *line,
+run_pipeline(ShellState *shell, Pipeline *pipeline, const char *line,
              int multiwatch, size_t multiwatch_slot)
 {
     size_t count = pipeline->count;
@@ -557,7 +583,7 @@ run_pipeline(Shell *shell, Pipeline *pipeline, const char *line,
     pid_t *children = NULL;
     ShellJob *job = NULL;
     pid_t pgid = 0;
-    char **child_environment = environ;
+    pid_t supervisor_pid = getpid();
     size_t started = 0;
     size_t i;
     int result = 1;
@@ -608,10 +634,12 @@ run_pipeline(Shell *shell, Pipeline *pipeline, const char *line,
         job->states == NULL || job->status_fds == NULL || job->command == NULL)
         goto setup_failure;
     for (i = 0; i < count; ++i) {
-        prepared[i].executable = resolve_executable(shell, pipeline->commands[i].argv[0]);
+        prepared[i].executable = resolve_executable(
+            shell, pipeline->commands[i].argv[0]);
         if (prepared[i].executable == NULL) {
             int saved_errno = errno;
-            (void)emit_error(shell, pipeline->commands[i].argv[0], strerror(saved_errno));
+            (void)emit_error(shell, pipeline->commands[i].argv[0],
+                             strerror(saved_errno));
             result = saved_errno == EACCES ? 126 : 127;
             goto cleanup;
         }
@@ -676,6 +704,14 @@ run_pipeline(Shell *shell, Pipeline *pipeline, const char *line,
         if (child == 0) {
             int saved_errno;
             pid_t wanted_pgid = pgid == 0 ? 0 : pgid;
+            /* Do not orphan a process-mode command if its tab supervisor
+             * crashes. The parent check closes the fork/prctl race. */
+            if (shell->process_backend &&
+                (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 ||
+                 getppid() != supervisor_pid)) {
+                errno = ESRCH;
+                goto child_failure;
+            }
             if (setpgid(0, wanted_pgid) < 0)
                 goto child_failure;
             for (size_t j = 0; j < count; ++j) {
@@ -721,8 +757,10 @@ run_pipeline(Shell *shell, Pipeline *pipeline, const char *line,
                 close_fd(&prepared[j].input_fd);
                 close_fd(&prepared[j].output_fd);
             }
-            execve(prepared[i].executable, pipeline->commands[i].argv,
-                   child_environment);
+            execvp(pipeline->commands[i].argv[0], pipeline->commands[i].argv);
+            saved_errno = errno;
+            child_write_errno(statuses[i][1], saved_errno);
+            _exit(126);
 child_failure:
             saved_errno = errno;
             child_write_errno(statuses[i][1], saved_errno);
@@ -782,6 +820,7 @@ child_failure:
     job_registered = 1;
     shell->active_pgid = job->foreground ? pgid : 0;
     (void)pthread_mutex_unlock(&shell->mutex);
+    emit_job_state(shell, job, 0);
     for (i = 0; i < count; ++i)
         close_fd(&statuses[i][1]);
     free(statuses);
@@ -863,15 +902,16 @@ cleanup:
 }
 
 static int
-wait_for_job(Shell *shell, ShellJob *job)
+wait_for_job(ShellState *shell, ShellJob *job)
 {
     job->foreground = 1;
     (void)pthread_mutex_lock(&shell->mutex);
     shell->active_pgid = job->pgid;
     (void)pthread_mutex_unlock(&shell->mutex);
     for (;;) {
-        struct pollfd pfds[2];
+        struct pollfd pfds[3];
         nfds_t count = 0;
+        (void)shell_state_service_control(shell);
         execute_reap_jobs(shell);
         if (job->completed) {
             job->foreground = 0;
@@ -902,12 +942,14 @@ wait_for_job(Shell *shell, ShellJob *job)
             pfds[count++] = (struct pollfd){.fd=job->capture_fd,.events=POLLIN|POLLHUP};
         if (job->stderr_fd >= 0)
             pfds[count++] = (struct pollfd){.fd=job->stderr_fd,.events=POLLIN|POLLHUP};
+        if (shell->control_fd >= 0)
+            pfds[count++] = (struct pollfd){.fd=shell->control_fd,.events=POLLIN};
         (void)poll(pfds, count, 100);
     }
 }
 
 static void
-job_print_list(Shell *shell)
+job_print_list(ShellState *shell)
 {
     ShellJob *job;
     for (job = shell->jobs; job != NULL; job = job->next) {
@@ -940,7 +982,7 @@ parse_job_id(const char *argument)
 }
 
 static ShellJob *
-find_job(Shell *shell, unsigned id)
+find_job(ShellState *shell, unsigned id)
 {
     ShellJob *job;
     ShellJob *latest = NULL;
@@ -954,7 +996,7 @@ find_job(Shell *shell, unsigned id)
 }
 
 static int
-execute_job_builtin(Shell *shell, Command *command, int *recognized)
+execute_job_builtin(ShellState *shell, Command *command, int *recognized)
 {
     const char *name = command->argv[0];
     ShellJob *job;
@@ -989,6 +1031,7 @@ execute_job_builtin(Shell *shell, Command *command, int *recognized)
                 job->states[i] = 0;
         job->foreground = 0;
         job->stopped_notified = 0;
+        emit_job_state(shell, job, 0);
         {
             char message[1024];
             int length = snprintf(message, sizeof(message), "[%u] %s\n",
@@ -1004,6 +1047,8 @@ execute_job_builtin(Shell *shell, Command *command, int *recognized)
     for (size_t i = 0; i < job->count; ++i)
         if (job->states[i] == 1)
             job->states[i] = 0;
+    job->foreground = 1;
+    emit_job_state(shell, job, 0);
     {
         char message[1024];
         int length = snprintf(message, sizeof(message), "%s\n", job->command);
@@ -1015,7 +1060,7 @@ execute_job_builtin(Shell *shell, Command *command, int *recognized)
 }
 
 void
-execute_cleanup_jobs(Shell *shell)
+execute_cleanup_jobs(ShellState *shell)
 {
     ShellJob *jobs;
     ShellJob *job;
@@ -1064,10 +1109,10 @@ time_add_seconds(struct timespec value, time_t seconds)
 }
 
 static void
-watch_failure(Shell *shell, const char *command, const char *detail)
+watch_failure(ShellState *shell, const char *command, const char *detail)
 {
     char message[2048];
-    int n = snprintf(message, sizeof(message), "\"%s\", %lld:\n--------------------\n%s\n--------------------\n",
+    int n = snprintf(message, sizeof(message), "\"%s\", %lld:\n----------------------------------------------------\n%s\n----------------------------------------------------\n",
                      command, (long long)time(NULL), detail);
     if (n > 0)
         emit_output(shell, message, (size_t)n < sizeof(message) ? (size_t)n : sizeof(message) - 1);
@@ -1139,7 +1184,7 @@ fail:
 }
 
 static void
-watch_remove_completed(Shell *shell, WatchItem *items, size_t count)
+watch_remove_completed(ShellState *shell, WatchItem *items, size_t count)
 {
     ShellJob **link;
     ShellJob *removed = NULL;
@@ -1171,7 +1216,7 @@ watch_remove_completed(Shell *shell, WatchItem *items, size_t count)
 }
 
 static void
-watch_stop_jobs(Shell *shell)
+watch_stop_jobs(ShellState *shell)
 {
     ShellJob **link;
     ShellJob *removed = NULL;
@@ -1203,7 +1248,7 @@ watch_stop_jobs(Shell *shell)
 }
 
 static int
-execute_multiwatch(Shell *shell, char **commands, size_t count)
+execute_multiwatch(ShellState *shell, char **commands, size_t count)
 {
     WatchItem *items = calloc(count, sizeof(*items));
     if (items == NULL) return emit_error(shell, "multiWatch", "out of memory");
@@ -1223,6 +1268,10 @@ execute_multiwatch(Shell *shell, char **commands, size_t count)
         nfds_t fd_count = 0;
         int timeout = 100;
         int stop;
+        (void)pthread_mutex_lock(&shell->mutex);
+        stop = shell->multiwatch_stop || shell->stopping;
+        (void)pthread_mutex_unlock(&shell->mutex);
+        (void)shell_state_service_control(shell);
         (void)pthread_mutex_lock(&shell->mutex);
         stop = shell->multiwatch_stop || shell->stopping;
         (void)pthread_mutex_unlock(&shell->mutex);
@@ -1256,6 +1305,7 @@ execute_multiwatch(Shell *shell, char **commands, size_t count)
         }
         for (ShellJob *job = shell->jobs; job != NULL; job = job->next)
             if (job->multiwatch && !job->completed && job->capture_fd >= 0) ++fd_count;
+        if (shell->control_fd >= 0) ++fd_count;
         if (fd_count != 0) fds = calloc(fd_count, sizeof(*fds));
         if (fds != NULL) {
             nfds_t n = 0;
@@ -1265,6 +1315,10 @@ execute_multiwatch(Shell *shell, char **commands, size_t count)
                     fds[n].events = POLLIN | POLLHUP;
                     ++n;
                 }
+            }
+            if (shell->control_fd >= 0) {
+                fds[n].fd = shell->control_fd;
+                fds[n].events = POLLIN;
             }
         }
         (void)clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1291,7 +1345,7 @@ has_script_suffix(const char *path)
 }
 
 static int
-has_shebang(Shell *shell, const char *path)
+has_shebang(ShellState *shell, const char *path)
 {
     unsigned char prefix[2];
     int fd = openat(shell->cwd_fd, path, O_RDONLY | O_CLOEXEC);
@@ -1303,7 +1357,7 @@ has_shebang(Shell *shell, const char *path)
 }
 
 int
-execute_line(Shell *shell, const char *line, int *should_exit)
+execute_line(ShellState *shell, const char *line, int *should_exit)
 {
     Pipeline pipeline;
     ParseError error;
@@ -1437,7 +1491,7 @@ execute_line(Shell *shell, const char *line, int *should_exit)
 }
 
 int
-execute_interactive_line(Shell *shell, const char *line, int *should_exit)
+execute_interactive_line(ShellState *shell, const char *line, int *should_exit)
 {
     char *expanded = NULL;
     int status;

@@ -179,6 +179,11 @@ main(void)
     assert(key_config_load(&config, "/tmp/terminator-missing-key-config") == 0);
     assert(key_config_match(&config, XK_t, ControlMask) == SHORTCUT_NEW_TAB);
 
+    char lock_path[512];
+    assert(snprintf(lock_path, sizeof(lock_path), "%s.lock", history_path) > 0);
+    assert(unlink(lock_path) == 0);
+    assert(snprintf(lock_path, sizeof(lock_path), "%s.lock", bulk_history_path) > 0);
+    assert(unlink(lock_path) == 0);
     assert(unlink(history_path) == 0);
     assert(unlink(config_path) == 0);
     puts("history/config tests passed");

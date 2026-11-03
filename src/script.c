@@ -431,7 +431,7 @@ script_program_free(ScriptProgram *program)
 }
 
 const char *
-script_variable_get(Shell *shell, const char *name)
+script_variable_get(ShellState *shell, const char *name)
 {
     for (ShellVariable *v = shell->variables; v != NULL; v = v->next)
         if (strcmp(v->name, name) == 0) return v->value;
@@ -440,7 +440,7 @@ script_variable_get(Shell *shell, const char *name)
 }
 
 static int
-variable_set(Shell *shell, const char *name, const char *value)
+variable_set(ShellState *shell, const char *name, const char *value)
 {
     ShellVariable *v;
     for (v = shell->variables; v != NULL; v = v->next)
@@ -497,10 +497,10 @@ append_escaped(char **out, size_t *length, size_t *capacity, const char *value,
 }
 
 static int
-expand_text(Shell *, const char *, char **, int *, int, unsigned);
+expand_text(ShellState *, const char *, char **, int *, int, unsigned);
 
 static int
-run_substitution(Shell *shell, const char *text, size_t line, char **result, unsigned depth)
+run_substitution(ShellState *shell, const char *text, size_t line, char **result, unsigned depth)
 {
     ScriptProgram *program = NULL;
     ScriptError error;
@@ -578,7 +578,7 @@ translate_nested_backticks(char *text)
 }
 
 static int
-expand_text(Shell *shell, const char *source, char **result, int *quoted_result,
+expand_text(ShellState *shell, const char *source, char **result, int *quoted_result,
             int preserve_expansion_spaces, unsigned depth)
 {
     size_t capacity = 0, length = 0;
@@ -659,7 +659,7 @@ expand_text(Shell *shell, const char *source, char **result, int *quoted_result,
 }
 
 int
-script_expand_command(Shell *shell, const char *command, char **expanded)
+script_expand_command(ShellState *shell, const char *command, char **expanded)
 {
     return expand_text(shell, command, expanded, NULL, 0, 0);
 }
@@ -724,9 +724,11 @@ validate_test(const char *text, size_t line, ScriptError *error)
     free(inside);
     int valid = tokens.count == 2 && (strcmp(tokens.items[0].text, "-f") == 0 || strcmp(tokens.items[0].text, "-d") == 0) && tokens.items[1].type == TOKEN_WORD;
     valid = valid || (tokens.count == 3 && tokens.items[0].type == TOKEN_WORD && tokens.items[2].type == TOKEN_WORD &&
-                      (strcmp(tokens.items[1].text, "-eq") == 0 || strcmp(tokens.items[1].text, "-gt") == 0));
+                      (strcmp(tokens.items[1].text, "-eq") == 0 ||
+                       strcmp(tokens.items[1].text, "-gt") == 0 ||
+                       strcmp(tokens.items[1].text, "=") == 0));
     lexer_tokens_free(&tokens);
-    return valid ? 0 : error_set(error, line, "tests support only -eq, -gt, -f, and -d");
+    return valid ? 0 : error_set(error, line, "tests support only =, -eq, -gt, -f, and -d");
 }
 
 static int
@@ -789,7 +791,7 @@ validate_command(const char *text, size_t line, ScriptError *error, unsigned dep
 }
 
 static int
-evaluate_test(Shell *shell, const char *expression, size_t line)
+evaluate_test(ShellState *shell, const char *expression, size_t line)
 {
     char *expanded = NULL;
     int ignored;
@@ -809,15 +811,19 @@ evaluate_test(Shell *shell, const char *expression, size_t line)
         int rc = fstatat(shell->cwd_fd, tokens.items[1].text, &st, 0);
         result = strcmp(tokens.items[0].text, "-f") == 0 ? (rc == 0 && S_ISREG(st.st_mode)) : (rc == 0 && S_ISDIR(st.st_mode));
     } else {
-        char *a_end, *b_end; errno=0; long a=strtol(tokens.items[0].text,&a_end,10); long b=strtol(tokens.items[2].text,&b_end,10);
-        if(errno||*a_end||*b_end) result=0;
-        else result=strcmp(tokens.items[1].text,"-eq")==0 ? a==b : a>b;
+        if (strcmp(tokens.items[1].text, "=") == 0) {
+            result = strcmp(tokens.items[0].text, tokens.items[2].text) == 0;
+        } else {
+            char *a_end, *b_end; errno=0; long a=strtol(tokens.items[0].text,&a_end,10); long b=strtol(tokens.items[2].text,&b_end,10);
+            if(errno||*a_end||*b_end) result=0;
+            else result=strcmp(tokens.items[1].text,"-eq")==0 ? a==b : a>b;
+        }
     }
     lexer_tokens_free(&tokens); free(expanded); return result ? 0 : 1;
 }
 
 static int
-execute_list(Shell *shell, StatementList *list, int *status, int *exited, int *exit_status)
+execute_list(ShellState *shell, StatementList *list, int *status, int *exited, int *exit_status)
 {
     for (size_t i=0; i<list->count && !*exited; ++i) {
         (void)pthread_mutex_lock(&shell->mutex);
@@ -861,7 +867,7 @@ execute_list(Shell *shell, StatementList *list, int *status, int *exited, int *e
 }
 
 int
-script_execute(Shell *shell, ScriptProgram *program, int argc, char **argv, int *exit_status)
+script_execute(ShellState *shell, ScriptProgram *program, int argc, char **argv, int *exit_status)
 {
     char **old_args=shell->script_args; size_t old_argc=shell->script_argc; int old_status=shell->script_status;
     int old_active, old_cancelled;
@@ -885,7 +891,7 @@ script_execute(Shell *shell, ScriptProgram *program, int argc, char **argv, int 
 }
 
 int
-script_invoke(Shell *shell, const char *path, int argc, char **argv,
+script_invoke(ShellState *shell, const char *path, int argc, char **argv,
               int source_mode, int *exit_status)
 {
     int fd=openat(shell->cwd_fd,path,O_RDONLY|O_CLOEXEC);

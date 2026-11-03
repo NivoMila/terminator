@@ -1,3 +1,4 @@
 /terminator
 /src/*.o
 /tests/parser_test
+/tests/*_test

@@ -95,6 +95,21 @@ read_file(const char *path, char *buffer, size_t size)
     close(fd);
 }
 
+static void
+write_test_file(const char *path, const char *text, mode_t mode)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    size_t length = strlen(text), offset = 0;
+    assert(fd >= 0);
+    while (offset < length) {
+        ssize_t amount = write(fd, text + offset, length - offset);
+        assert(amount > 0);
+        offset += (size_t)amount;
+    }
+    assert(fchmod(fd, mode) == 0);
+    assert(close(fd) == 0);
+}
+
 int
 main(void)
 {
@@ -102,12 +117,20 @@ main(void)
     char history_path[] = "/tmp/terminator-shell-history-XXXXXX";
     char path[512];
     char contents[256];
+    char executable_path[512], non_executable_path[512], test_path[4096];
+    char *original_path = getenv("PATH") == NULL ? NULL : strdup(getenv("PATH"));
     int wake[2];
     Shell *shell;
     History *history;
     Result result;
 
     assert(mkdtemp(directory) != NULL);
+    assert(snprintf(executable_path, sizeof(executable_path),
+                    "%s/terminator-execvp-fixture", directory) > 0);
+    assert(snprintf(non_executable_path, sizeof(non_executable_path),
+                    "%s/terminator-nonexec-fixture", directory) > 0);
+    assert(symlink("/bin/echo", executable_path) == 0);
+    write_test_file(non_executable_path, "plain non-executable fixture\n", 0600);
     assert(pipe(wake) == 0);
     int flags = fcntl(wake[0], F_GETFL, 0);
     assert(flags >= 0 && fcntl(wake[0], F_SETFL, flags | O_NONBLOCK) == 0);
@@ -150,6 +173,36 @@ main(void)
     (void)snprintf(command, sizeof(command), "cd %s", directory);
     result = run_line(shell, wake[0], command);
     free(result.data);
+    int path_length = snprintf(test_path, sizeof(test_path), "%s:%s",
+                               directory,
+                               original_path == NULL ? "/usr/bin:/bin" : original_path);
+    assert(path_length > 0 && (size_t)path_length < sizeof(test_path));
+    assert(setenv("PATH", test_path, 1) == 0);
+
+    expect_contains(shell, wake[0], "terminator-execvp-fixture execvp-fixture-ok",
+                    "execvp-fixture-ok");
+    expect_contains(shell, wake[0], "./terminator-execvp-fixture execvp-fixture-ok",
+                    "execvp-fixture-ok");
+    (void)snprintf(command, sizeof(command), "%s execvp-fixture-ok", executable_path);
+    expect_contains(shell, wake[0], command, "execvp-fixture-ok");
+    result = run_line(shell, wake[0], "terminator-command-not-found-execvp-test");
+    assert(result.status == 127);
+    free(result.data);
+    result = run_line(shell, wake[0], "./terminator-nonexec-fixture");
+    assert(result.status == 126);
+    free(result.data);
+    result = run_line(shell, wake[0],
+                      "terminator-execvp-fixture execvp-fixture-ok | cat > execvp-output.txt");
+    assert(result.status == 0);
+    free(result.data);
+    (void)snprintf(path, sizeof(path), "%s/execvp-output.txt", directory);
+    read_file(path, contents, sizeof(contents));
+    assert(strcmp(contents, "execvp-fixture-ok\n") == 0);
+    if (original_path != NULL)
+        assert(setenv("PATH", original_path, 1) == 0);
+    else
+        assert(unsetenv("PATH") == 0);
+    free(original_path);
     expect_contains(shell, wake[0], "cat < input.txt", "from-input");
     expect_contains(shell, wake[0], "cat < input.txt | tr a-z A-Z", "FROM-INPUT");
 
@@ -221,6 +274,10 @@ main(void)
 
     shell_destroy(shell);
     history_close(history);
+    char history_lock_path[512];
+    assert(snprintf(history_lock_path, sizeof(history_lock_path), "%s.lock",
+                    history_path) > 0);
+    assert(unlink(history_lock_path) == 0);
     assert(unlink(history_path) == 0);
     close(wake[0]);
     close(wake[1]);
@@ -235,6 +292,8 @@ main(void)
     close(wake[0]);
     close(wake[1]);
     (void)snprintf(path, sizeof(path), "%s/copied.txt", directory);
+    assert(unlink(path) == 0);
+    (void)snprintf(path, sizeof(path), "%s/execvp-output.txt", directory);
     assert(unlink(path) == 0);
     (void)snprintf(path, sizeof(path), "%s/side-effect.txt", directory);
     assert(unlink(path) == 0);
@@ -252,6 +311,8 @@ main(void)
     assert(unlink(path) == 0);
     (void)snprintf(path, sizeof(path), "%s/result.txt", directory);
     assert(unlink(path) == 0);
+    assert(unlink(executable_path) == 0);
+    assert(unlink(non_executable_path) == 0);
     assert(rmdir(directory) == 0);
     puts("shell pipeline/redirection tests passed");
     return 0;

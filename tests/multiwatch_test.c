@@ -67,6 +67,7 @@ int main(void) {
     assert(shell_signal_foreground(a, 0) == 0);
     Result r = finish(a, wa[0]);
     assert(strstr(r.text, "\"printf one\", ") && strstr(r.text, "one"));
+    assert(strstr(r.text, "----------------------------------------------------"));
     free(r.text);
 
     assert(shell_submit(a, "multiWatch [\"printf alpha\", \"printf beta\"]") == 0);

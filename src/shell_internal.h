@@ -3,9 +3,12 @@
 
 #include "shell.h"
 #include "history.h"
+#include "process_runtime.h"
 
 #include <pthread.h>
 #include <sys/types.h>
+
+typedef struct ShellState ShellState;
 
 typedef struct ShellCommand {
     char *line;
@@ -48,14 +51,17 @@ typedef struct ShellJob {
     struct ShellJob *next;
 } ShellJob;
 
-struct Shell {
-    pthread_t thread;
+typedef int (*ShellStateEmit)(void *context, ShellEventType type,
+                              const char *text, size_t length, int status);
+
+/* Execution state has no worker queue or thread lifecycle. A runtime supplies
+ * the output sink and invokes shell_state_execute() when it receives work. */
+struct ShellState {
     pthread_mutex_t mutex;
-    pthread_cond_t commands_ready;
-    pthread_cond_t events_space;
-    int initialized;
     int stopping;
-    int worker_exited;
+    int mutex_initialized;
+    int shutdown_complete;
+    int process_backend;
     pid_t active_pgid;
     int multiwatch_active;
     int multiwatch_stop;
@@ -74,8 +80,27 @@ struct Shell {
     ShellJob *jobs;
     int cwd_fd;
     char *cwd_path;
-    int wake_write_fd;
     History *history;
+    int control_fd;
+    ShellStateEmit emit;
+    void *emit_context;
+};
+
+/* Thread-mode runtime handle. The public Shell API continues to refer to this
+ * adapter; process-mode code can own ShellState without starting a thread. */
+struct Shell {
+    int process_mode;
+    ProcessRuntime *process;
+    ShellState state;
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t commands_ready;
+    pthread_cond_t events_space;
+    int initialized;
+    int stopping;
+    int worker_exited;
+    int synchronization_initialized;
+    int wake_write_fd;
     ShellCommand *command_head;
     ShellCommand *command_tail;
     ShellEventNode *event_head;
@@ -83,11 +108,23 @@ struct Shell {
     size_t queued_output_bytes;
 };
 
-int shell_emit(Shell *shell, ShellEventType type,
+int shell_emit(ShellState *state, ShellEventType type,
                const char *text, size_t length, int status);
-int execute_line(Shell *shell, const char *line, int *should_exit);
-int execute_interactive_line(Shell *shell, const char *line, int *should_exit);
-void execute_reap_jobs(Shell *shell);
-void execute_cleanup_jobs(Shell *shell);
+int execute_line(ShellState *state, const char *line, int *should_exit);
+int execute_interactive_line(ShellState *state, const char *line, int *should_exit);
+void execute_reap_jobs(ShellState *state);
+void execute_cleanup_jobs(ShellState *state);
+
+int shell_state_init(ShellState *state, History *history,
+                     ShellStateEmit emit, void *emit_context);
+int shell_state_execute(ShellState *state, const char *line, int *should_exit);
+void shell_state_reap_jobs(ShellState *state);
+int shell_state_signal_foreground(ShellState *state, int suspend);
+int shell_state_service_control(ShellState *state);
+void shell_state_request_shutdown(ShellState *state);
+int shell_state_complete_path(ShellState *state, const char *prefix,
+                              char ***matches, size_t *match_count);
+void shell_state_shutdown(ShellState *state);
+void shell_state_destroy(ShellState *state);
 
 #endif
